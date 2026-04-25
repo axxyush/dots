@@ -27,10 +27,16 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+
+# Ensure repo root is importable when running as a script:
+# `.venv/bin/python agents/sensegrid_agent.py`
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO_ROOT))
 
 # Load .env from the repo root BEFORE we read any os.environ values. Without
 # override=False existing shell vars still win, so `export ASI_ONE_API_KEY=...`
@@ -38,7 +44,6 @@ from uuid import uuid4
 try:
     from dotenv import load_dotenv  # type: ignore
 
-    _REPO_ROOT = Path(__file__).resolve().parents[1]
     load_dotenv(_REPO_ROOT / ".env", override=False)
 except ImportError:
     pass  # python-dotenv is optional; env vars can still be set manually.
@@ -52,8 +57,8 @@ from uagents_core.contrib.protocols.chat import (
     chat_protocol_spec,
 )
 
-from tools import dispatch
-from payment import (
+from agents.tools import dispatch
+from agents.payment import (
     GAS_BUFFER_ATESTFET,
     PAYMENT_TIMEOUT_S,
     FAUCET_URL,
@@ -190,18 +195,12 @@ def _clear_session(ctx, sender: str) -> None:
 
 def _process_plans(
     urls: list[str],
-    blurred: bool,
     logger: logging.Logger,
 ) -> tuple[list[str], list[str], dict[str, int], list[dict], dict[str, int], str, list[str], str | None]:
-    """Run download → parse → generate_braille_map(blurred) → upload for each URL.
-    Returns (json_paths, png_urls, room_summary, ada_findings, ada_summary, ada_report_text, ada_pdf_urls, error_or_None).
-
-    ``png_urls`` contains the *tactile* braille map URLs — the primary
-    deliverable for a blind user. A separate text companion is produced
-    (and uploaded post-payment) so screen readers can narrate the layout.
-    """
+    """Run download → parse for each URL.
+    Returns (json_paths, image_paths, room_summary, ada_findings, ada_summary, ada_report_text, ada_pdf_urls, error_or_None)."""
     json_paths: list[str] = []
-    png_urls: list[str] = []
+    image_paths: list[str] = []
     room_summary: dict[str, int] = {}
     ada_findings: list[dict] = []
     ada_report_text: str = ""
@@ -218,22 +217,9 @@ def _process_plans(
         dl = dispatch("download_image", {"url": url})
         if "error" in dl:
             return [], [], {}, [], {}, "", [], f"Couldn't download {url}: {dl['error']}"
+        image_paths.append(dl["image_path"])
 
         parsed = dispatch("parse_floorplan_llm", {"image_path": dl["image_path"]})
-        if "error" in parsed:
-            logger.warning(
-                "⚠️  LLM extractor failed — falling back to CV pipeline.\n"
-                "    reason: %s\n"
-                "    Check that OPENAI_API_KEY is set in .env AND that "
-                "python-dotenv is installed (`pip install python-dotenv`).",
-                parsed["error"],
-            )
-            parsed = dispatch("parse_floorplan", {"image_path": dl["image_path"]})
-        else:
-            logger.info(
-                "✅  LLM extractor succeeded — %s rooms via %s",
-                parsed.get("room_count"), parsed.get("labeling_model"),
-            )
         if "error" in parsed:
             return [], [], {}, [], {}, "", [], f"Couldn't parse {url}: {parsed['error']}"
 
@@ -253,18 +239,6 @@ def _process_plans(
             if "error" not in up_pdf and up_pdf.get("url"):
                 ada_pdf_urls.append(up_pdf["url"])
 
-        rec = dispatch(
-            "generate_braille_map",
-            {"json_path": parsed["json_path"], "blurred": blurred},
-        )
-        if "error" in rec:
-            return [], [], {}, [], {}, "", [], f"Tactile map render failed: {rec['error']}"
-
-        up = dispatch("upload_artifact", {"file_path": rec["png_path"]})
-        if "error" in up:
-            return [], [], {}, [], {}, "", [], f"Upload failed: {up['error']}"
-        png_urls.append(up["url"])
-
     # De-duplicate similar findings across multi-plan batches.
     seen = set()
     uniq_findings: list[dict] = []
@@ -275,7 +249,7 @@ def _process_plans(
         seen.add(key)
         uniq_findings.append(finding)
 
-    return json_paths, png_urls, room_summary, uniq_findings, ada_summary, ada_report_text, ada_pdf_urls, None
+    return json_paths, image_paths, room_summary, uniq_findings, ada_summary, ada_report_text, ada_pdf_urls, None
 
 
 def _format_ada_report_block(
@@ -324,9 +298,9 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
         urls = _extract_urls(user_text)
         if not urls:
             return (
-                "Send one or more floor-plan image URLs (http/https). "
-                "I'll quote a price in test FET, show you a blurred preview, "
-                "then deliver the full reconstruction once payment lands."
+                    "Send one or more floor-plan image URLs (http/https). "
+                    "I'll quote a price in test FET, then deliver a tactile map "
+                    "and structured JSON once payment lands."
             )
         q = quote_for(len(urls))
         sess = {
@@ -352,8 +326,8 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
                 f"{sess['quoted_fet_str']} test FET, or 'no' to cancel."
             )
 
-        json_paths, blurred_urls, room_summary, ada_findings, ada_summary, ada_report_text, ada_pdf_urls, err = _process_plans(
-            sess["urls"], blurred=True, logger=logger
+        json_paths, image_paths, room_summary, ada_findings, ada_summary, ada_report_text, ada_pdf_urls, err = _process_plans(
+            sess["urls"], logger=logger
         )
         if err:
             _clear_session(ctx, sender)
@@ -371,7 +345,7 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
             {
                 "state": STATE_PREVIEWED,
                 "json_paths": json_paths,
-                "blurred_urls": blurred_urls,
+                "image_paths": image_paths,
                 "room_summary": room_summary,
                 "ada_findings": ada_findings,
                 "ada_summary": ada_summary,
@@ -385,7 +359,6 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
         _save_session(ctx, sender, sess)
 
         rooms_str = ", ".join(f"{k}: {v}" for k, v in sorted(room_summary.items()))
-        previews = "\n".join(f"- {u}" for u in blurred_urls)
         pdfs = "\n".join(f"- {u}" for u in sess.get("ada_pdf_urls", []))
         pdf_block = f"**ADA report (PDF):**\n{pdfs}\n\n" if pdfs else ""
         ada_text = _format_ada_report_block(
@@ -399,14 +372,11 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
         return (
             f"Parsed {sum(room_summary.values())} rooms across {sess['n_plans']} plan{plural} "
             f"({rooms_str}).\n\n"
-            f"**Tactile Braille map — blurred preview:**\n{previews}\n\n"
             f"{pdf_block}"
             f"{ada_fallback}"
             f"Reply **'yes'** to authorize payment of **{sess['quoted_fet_str']} test FET** "
-            f"— I'll execute the transfer on-chain (Dorado) automatically, then deliver the "
-            f"sharp tactile map (print-ready for swell paper / embosser), a plain-text "
-            f"screen-reader companion, and a 3D-printable **STL** (18 cm × 18 cm × "
-            f"8 mm slab). Reply 'no' to cancel.\n\n"
+            f"— I'll execute the transfer on-chain (Dorado) automatically and deliver the "
+            f"tactile map + structured JSON. Reply 'no' to cancel.\n\n"
             f"_Demo wallet: `{user_addr}` — top up at {FAUCET_URL}/{user_addr} if needed._"
         )
 
@@ -463,52 +433,51 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
                 f"Reply 'yes' in a few seconds to retry."
             )
 
-        # Render unblurred tactile map + text companion + STL + upload + deliver.
-        final_urls: list[str] = []
-        txt_urls: list[str] = []
+        # Upload JSON + deliver tactile map.
         json_urls: list[str] = []
-        stl_urls: list[str] = []
-        stl_info: dict | None = None
+        tactile_png_urls: list[str] = []
+        tactile_errors: list[str] = []
+
+        # Structured JSON.
         for jp in sess["json_paths"]:
-            rec = dispatch("generate_braille_map", {"json_path": jp, "blurred": False})
-            if "error" in rec:
-                return f"Tactile map render failed after payment: {rec['error']}"
-            up = dispatch("upload_artifact", {"file_path": rec["png_path"]})
-            if "error" in up:
-                return f"Upload failed after payment: {up['error']}"
-            final_urls.append(up["url"])
-            if rec.get("txt_path"):
-                up_txt = dispatch("upload_artifact", {"file_path": rec["txt_path"]})
-                if "error" not in up_txt:
-                    txt_urls.append(up_txt["url"])
             up_json = dispatch("upload_artifact", {"file_path": jp})
             if "error" not in up_json:
                 json_urls.append(up_json["url"])
 
-            # 3D-printable STL (18 cm × 18 cm × 8 mm by default)
-            stl_rec = dispatch("generate_braille_stl", {"json_path": jp})
-            if "error" in stl_rec:
-                logger.warning("STL export failed for %s: %s", jp, stl_rec["error"])
-            else:
-                stl_info = stl_rec
-                up_stl = dispatch("upload_artifact", {"file_path": stl_rec["stl_path"]})
-                if "error" not in up_stl:
-                    stl_urls.append(up_stl["url"])
-                else:
-                    logger.warning("STL upload failed for %s: %s",
-                                   stl_rec["stl_path"], up_stl["error"])
+        # Tactile map generated directly from the input image.
+        # Prefer reusing local downloads from earlier steps, but fall back to re-downloading
+        # from the original URLs so the tactile map is always produced.
+        img_paths = list(sess.get("image_paths", []) or [])
+        if not img_paths:
+            for url in sess.get("urls", []) or []:
+                dl = dispatch("download_image", {"url": url})
+                if "error" in dl:
+                    tactile_errors.append(f"{url}: download failed ({dl['error']})")
+                    continue
+                img_paths.append(dl["image_path"])
+
+        for img_path in img_paths:
+            t = dispatch(
+                "tactile_map_from_image_nanobanana",
+                {"image_path": img_path, "model": "gemini-3-pro-image-preview"},
+            )
+            if "error" in t:
+                err = str(t.get("error"))
+                tactile_errors.append(f"{Path(img_path).name}: {err}")
+                logger.warning("tactile nanobanana failed for %s: %s", img_path, err)
+                continue
+            up_t = dispatch("upload_artifact", {"file_path": t["png_path"]})
+            if "error" in up_t:
+                tactile_errors.append(f"{Path(img_path).name}: upload failed ({up_t['error']})")
+                continue
+            tactile_png_urls.append(up_t["url"])
 
         _clear_session(ctx, sender)
-        finals = "\n".join(f"- {u}" for u in final_urls)
-        txts = "\n".join(f"- {u}" for u in txt_urls) if txt_urls else ""
         jsons = "\n".join(f"- {u}" for u in json_urls) if json_urls else ""
-        stls = "\n".join(f"- {u}" for u in stl_urls) if stl_urls else ""
-        plural = "s" if len(final_urls) > 1 else ""
+        tactile = "\n".join(f"- {u}" for u in tactile_png_urls) if tactile_png_urls else ""
         msg = (
             f"Payment of {sess['quoted_fet_str']} test FET confirmed on-chain "
-            f"(tx `{tx_hash}`).\n\n"
-            f"**Tactile Braille map{plural}** (print on swell paper or send to a "
-            f"tactile embosser):\n{finals}"
+            f"(tx `{tx_hash}`)."
         )
         if txts:
             msg += f"\n\n**Screen-reader companion (plain text):**\n{txts}"
@@ -522,15 +491,12 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
                 f"features; FDM-ready, no supports needed):\n{stls}"
             )
         if jsons:
-            msg += f"\n\n**Structured JSON:**\n{jsons}"
-        if sess.get("ada_pdf_urls"):
-            msg += "\n\nADA report (PDF):\n" + "\n".join(f"- {u}" for u in sess["ada_pdf_urls"])
-        else:
-            msg += "\n\n" + _format_ada_report_block(
-                ada_summary=sess.get("ada_summary", {}),
-                ada_findings=sess.get("ada_findings", []),
-                ada_report_text=sess.get("ada_report_text", ""),
-            )
+            msg += f"\n\nStructured JSON:\n{jsons}"
+        if tactile:
+            msg += f"\n\nTactile map:\n{tactile}"
+        if tactile_errors and not tactile_png_urls:
+            # Surface failures so users don't think it's silently missing.
+            msg += "\n\nTactile map generation failed:\n" + "\n".join(f"- {e}" for e in tactile_errors[:6])
         msg += "\n\nThanks!"
         return msg
 
@@ -544,6 +510,9 @@ agent = Agent(
     seed=AGENT_SEED,
     port=8001,
     mailbox=True,
+    handle="sensegrid",
+    description="Turn floorplan image URLs into structured JSON, reconstructions, and tactile outputs.",
+    readme_path=str(Path(__file__).resolve().parent / "SENSEGRID_README.md"),
     publish_agent_details=True,
 )
 

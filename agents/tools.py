@@ -28,34 +28,18 @@ try:
 except ImportError:
     pass
 
-import cv2  # noqa: E402
+try:
+    import cv2  # type: ignore  # noqa: E402
+    _CV2_OK = True
+except Exception:
+    cv2 = None  # type: ignore
+    _CV2_OK = False
 
-from cv_rooms import (  # noqa: E402
-    extract_rooms_cv_multiscale,
-    regions_to_floor_objects,
-)
+extract_rooms_cv_multiscale = None  # type: ignore
+regions_to_floor_objects = None  # type: ignore
 from ada_advisor import generate_ada_recommendations  # noqa: E402
 from render_map import render_floor_plan  # noqa: E402
-
-try:
-    from braille_map import render_tactile_map  # noqa: E402
-    _BRAILLE_IMPORT_OK = True
-except Exception as _braille_import_exc:  # pragma: no cover
-    render_tactile_map = None  # type: ignore
-    _BRAILLE_IMPORT_OK = False
-    logging.getLogger("sensegrid.tools").warning(
-        "Tactile braille map module unavailable: %s", _braille_import_exc
-    )
-
-try:
-    from stl_export import floor_plan_to_stl  # noqa: E402
-    _STL_IMPORT_OK = True
-except Exception as _stl_import_exc:  # pragma: no cover
-    floor_plan_to_stl = None  # type: ignore
-    _STL_IMPORT_OK = False
-    logging.getLogger("sensegrid.tools").warning(
-        "STL export module unavailable: %s", _stl_import_exc
-    )
+from braille_map import generate_braille_map  # noqa: E402
 
 try:
     from cv_gemini_refine import label_regions_global as _gemini_label_global  # noqa: E402
@@ -96,6 +80,115 @@ log = logging.getLogger("sensegrid.tools")
 ARTIFACT_DIR = Path(tempfile.gettempdir()) / "sensegrid_artifacts"
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 
+_NANOBANANA_TACTILE_PROMPT = """
+You are generating an accessibility tactile map for blind/low-vision users.
+
+INPUT: a floorplan image.
+OUTPUT: a single high-contrast raster image representing a tactile plaque-style map.
+
+Hard requirements:
+- Produce a CLEAN 2D DIAGRAM (orthographic top-down). No perspective, no 3D, no camera angle.
+- White background with ONLY black marks. No colors, no gray, no gradients, no shadows.
+- Do NOT “stylize” into a plaque with dark background. This must look like a printable diagram.
+- Everything must fit inside the canvas with a ~5% margin. Do not draw or place text outside the border.
+- This is a tactile map, not a Braille-only map. You do NOT need to replicate every room boundary using dots.
+- You MAY use both raised lines and tactile textures:
+  - walls/boundaries: thick solid lines (continuous)
+  - corridors: dotted/stipple texture
+  - room areas: sparse dot texture
+  - special areas (restroom/courtyard/etc): distinct hatch/wave pattern
+  - icons/markers: simple line icons are allowed
+- Preserve topology: rooms, walls, doors, and corridors must stay in correct relative position.
+- Add clear door gaps. Mark the main entrance with a clear star marker.
+- Add numbered markers for key rooms/objects and include an embedded legend panel mapping numbers/patterns/icons → labels.
+- No decorative elements, no extra branding. Text should be minimal and aligned.
+- Printable and legible at A4 size.
+
+If the source image is cluttered, simplify while preserving navigation-critical structure.
+""".strip()
+
+
+def tactile_map_from_image_nanobanana(image_path: str, model: str = "gemini-3-pro-image-preview") -> dict:
+    """Generate a tactile-map PNG directly from the input image (Nano Banana Pro)."""
+    p = Path(image_path)
+    if not p.exists():
+        return {"error": f"image not found: {image_path}"}
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return {"error": "GEMINI_API_KEY not set"}
+
+    try:
+        from google import genai  # type: ignore
+        from google.genai import types  # type: ignore
+    except Exception as exc:
+        return {"error": f"google-genai not available: {exc}"}
+
+    try:
+        img_bytes = p.read_bytes()
+        mime = "image/png" if p.suffix.lower() == ".png" else "image/jpeg"
+        img_part = types.Part.from_bytes(data=img_bytes, mime_type=mime)
+        client = genai.Client(api_key=api_key)
+        cfg = types.GenerateContentConfig(
+            response_modalities=["TEXT", "IMAGE"],
+            temperature=0.0,
+            image_config=types.ImageConfig(
+                aspect_ratio="4:3",
+                image_size="2K",
+            ),
+        )
+        resp = client.models.generate_content(
+            model=model,
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(text=_NANOBANANA_TACTILE_PROMPT),
+                        img_part,
+                    ],
+                )
+            ],
+            config=cfg,
+        )
+    except Exception as exc:
+        return {"error": f"generation failed: {exc}"}
+
+    out_path = ARTIFACT_DIR / (p.stem + "_tactile_nanobanana.png")
+
+    # Find first image part.
+    parts = getattr(resp, "parts", None) or []
+    for part in parts:
+        if getattr(part, "inline_data", None) is not None:
+            try:
+                img = part.as_image()
+                img.save(out_path)
+                return {"png_path": str(out_path), "model": model}
+            except Exception as exc:
+                return {"error": f"could not save output image: {exc}"}
+
+    # Fallback: search candidates if needed.
+    for cand in getattr(resp, "candidates", []) or []:
+        content = getattr(cand, "content", None)
+        if not content:
+            continue
+        for part in getattr(content, "parts", []) or []:
+            if getattr(part, "inline_data", None) is not None:
+                try:
+                    img = part.as_image()
+                    img.save(out_path)
+                    return {"png_path": str(out_path), "model": model}
+                except Exception as exc:
+                    return {"error": f"could not save output image: {exc}"}
+
+    # No image returned.
+    text = ""
+    for part in parts:
+        if getattr(part, "text", None):
+            text += part.text + "\n"
+    debug_path = ARTIFACT_DIR / (p.stem + "_tactile_nanobanana.txt")
+    debug_path.write_text(text or "(no image returned)", encoding="utf-8")
+    return {"error": f"model returned no image (see {debug_path})"}
+
 
 # ── Tool 1: download_image ───────────────────────────────────────────────────
 
@@ -135,6 +228,16 @@ def parse_floorplan(image_path: str) -> dict:
     p = Path(image_path)
     if not p.exists():
         return {"error": f"image not found: {image_path}"}
+
+    if not _CV2_OK or cv2 is None:
+        return {"error": "OpenCV not installed; use parse_floorplan_llm instead."}
+
+    global extract_rooms_cv_multiscale, regions_to_floor_objects
+    if extract_rooms_cv_multiscale is None or regions_to_floor_objects is None:
+        from cv_rooms import extract_rooms_cv_multiscale as _ex, regions_to_floor_objects as _r2o
+
+        extract_rooms_cv_multiscale = _ex
+        regions_to_floor_objects = _r2o
 
     img = cv2.imread(str(p), cv2.IMREAD_COLOR)
     if img is None:
@@ -463,6 +566,27 @@ def reconstruct_floorplan(json_path: str, blurred: bool = False) -> dict:
     }
 
 
+# ── Tool 4: braille_map_from_json ─────────────────────────────────────────────
+
+
+def braille_map_from_json(json_path: str, cols: int = 90) -> dict:
+    """Generate a tactile map PDF (ConnectDots pipeline) from result.json."""
+    p = Path(json_path)
+    if not p.exists():
+        return {"error": f"json not found: {json_path}"}
+
+    stem = p.stem.replace("_result", "")
+    out_pdf = ARTIFACT_DIR / f"{stem}_tactile_map.pdf"
+
+    res = generate_braille_map(
+        p,
+        out_pdf=out_pdf,
+        meters_width=12.0,
+    )
+    log.info("tactile pdf %s → %s", json_path, out_pdf)
+    return res
+
+
 # ── Tool 3b: generate_braille_map ────────────────────────────────────────────
 
 
@@ -708,18 +832,17 @@ TOOL_SPECS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "generate_braille_map",
+            "name": "braille_map_from_json",
             "description": (
-                "Generate a tactile Braille map (PNG + text companion) from a "
-                "parsed floor-plan JSON. Use this instead of reconstruct_floorplan "
-                "when the user wants an accessibility/tactile output for a blind "
-                "reader. The PNG is print-ready for swell paper / tactile embossers."
+                "Generate a tactile Braille map from a parsed floor-plan JSON. "
+                "Returns paths to a Braille-unicode text map, a legend text file, "
+                "and a dot-rendered PNG preview."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "json_path": {"type": "string", "description": "Absolute path to a result.json produced by parse_floorplan."},
-                    "blurred": {"type": "boolean", "description": "If true, return a blurred teaser preview (paywall-safe)."},
+                    "cols": {"type": "integer", "description": "Braille grid columns (higher = more detail).", "default": 90},
                 },
                 "required": ["json_path"],
             },
@@ -728,24 +851,18 @@ TOOL_SPECS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "generate_braille_stl",
+            "name": "tactile_map_from_image_nanobanana",
             "description": (
-                "Generate a 3D-printable STL of the tactile Braille map. "
-                "Default output is a square 18 cm × 18 cm slab with a 5 mm "
-                "base plate and 3 mm raised features (walls, room outlines, "
-                "patterns, plain-text labels, Braille dots, icons, compass, "
-                "legend) — i.e. 0.8 cm total height. Use this when the user "
-                "wants a downloadable STL file they can 3D-print."
+                "Generate a tactile-map PNG directly from an input floorplan image "
+                "using Gemini Nano Banana Pro image generation."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "json_path": {"type": "string", "description": "Absolute path to a result.json produced by parse_floorplan."},
-                    "base_size_cm": {"type": "number", "description": "Side length of the square slab in centimetres (default 18)."},
-                    "base_thickness_mm": {"type": "number", "description": "Thickness of the base plate in mm (default 5)."},
-                    "feature_height_mm": {"type": "number", "description": "Height of raised features in mm (default 3)."},
+                    "image_path": {"type": "string", "description": "Absolute path to a local image file."},
+                    "model": {"type": "string", "description": "Gemini image model id.", "default": "gemini-3-pro-image-preview"},
                 },
-                "required": ["json_path"],
+                "required": ["image_path"],
             },
         },
     },
@@ -775,8 +892,8 @@ _DISPATCH = {
     "parse_floorplan": parse_floorplan,
     "parse_floorplan_llm": parse_floorplan_llm,
     "reconstruct_floorplan": reconstruct_floorplan,
-    "generate_braille_map": generate_braille_map,
-    "generate_braille_stl": generate_braille_stl,
+    "braille_map_from_json": braille_map_from_json,
+    "tactile_map_from_image_nanobanana": tactile_map_from_image_nanobanana,
     "upload_artifact": upload_artifact,
 }
 

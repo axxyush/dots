@@ -13,12 +13,13 @@
     "corridors": 0
   },
   "counts_per_type": {
-    "bathroom": 5,
+    "bathroom": 7,
     "bedroom": 10,
-    "restroom": 6,
-    "stairs": 2,
-    "unknown": 6,
-    "utility": 2
+    "dining_room": 1,
+    "restroom": 5,
+    "stairs": 1,
+    "unknown": 4,
+    "utility": 3
   },
   "canvas_coverage_pct": 100.0,
   "room_overlaps_over_threshold": [

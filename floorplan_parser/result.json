@@ -217,8 +217,8 @@
       },
       {
         "id": "room_10",
-        "type": "unknown",
-        "label": "Unknown",
+        "type": "bathroom",
+        "label": "Bathroom",
         "position": {
           "x": 58.77,
           "y": 19.23,
@@ -257,8 +257,8 @@
       },
       {
         "id": "room_12",
-        "type": "unknown",
-        "label": "Unknown",
+        "type": "utility",
+        "label": "Utility",
         "position": {
           "x": 41.85,
           "y": 18.96,
@@ -417,8 +417,8 @@
       },
       {
         "id": "room_20",
-        "type": "restroom",
-        "label": "Restroom",
+        "type": "bathroom",
+        "label": "Bathroom",
         "position": {
           "x": 68.46,
           "y": 9.07,
@@ -617,8 +617,8 @@
       },
       {
         "id": "room_30",
-        "type": "stairs",
-        "label": "Stairs",
+        "type": "dining_room",
+        "label": "Dining Table",
         "position": {
           "x": 6.77,
           "y": 8.24,
