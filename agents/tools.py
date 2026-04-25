@@ -106,6 +106,69 @@ Rules:
 """.strip()
 
 
+_TACTILE_QA_CONTEXT_PROMPT = """
+You are extracting a compact, navigation-focused description from a tactile map image (black marks on white background).
+This tactile map may use patterns/symbols (dots, hatching) and may not contain readable text.
+
+Return plain text (no JSON) with these sections, each on its own line:
+- MAP_NAME: <if present, else 'unknown'>
+- ENTRANCE: <where the entrance marker is, e.g. "top edge", "bottom-left", or 'unknown'>
+- FEATURES: <comma-separated: stairs, elevator, restroom, food, check-in, seating, tunnel, etc. Only if clearly indicated by icons/symbols>
+- REGIONS: bullet list of distinct regions/zones by pattern (e.g. "dense dots region — top side", "hatched region — right side")
+- COUNTS: <counts of repeated symbols if obvious, e.g. "stairs: 2">
+- NOTES: <1 short line with uncertainty>
+
+Rules:
+- Do not invent labels. If you can't confidently identify a feature, omit it or mark unknown.
+- Use relative positions in the image (top/bottom/left/right/center).
+- Keep it short and usable for Q&A like "where are the stairs" or "how many entrances".
+""".strip()
+
+
+def qa_context_from_tactile_image_gemini(image_path: str, model: str = "gemini-2.5-pro") -> dict:
+    """Create a compact Q&A context blob from a tactile-map image (Gemini vision)."""
+    p = Path(image_path)
+    if not p.exists():
+        return {"error": f"image not found: {image_path}"}
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return {"error": "GEMINI_API_KEY not set"}
+
+    try:
+        from google import genai  # type: ignore
+        from google.genai import types  # type: ignore
+    except Exception as exc:
+        return {"error": f"Gemini client not available: {exc}"}
+
+    client = genai.Client(api_key=api_key)
+    try:
+        img_part = types.Part.from_bytes(data=p.read_bytes(), mime_type="image/png")
+        resp = client.models.generate_content(
+            model=model,
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(text=_TACTILE_QA_CONTEXT_PROMPT),
+                        img_part,
+                    ],
+                )
+            ],
+            config=types.GenerateContentConfig(
+                temperature=0.1,
+                max_output_tokens=1200,
+            ),
+        )
+    except Exception as exc:
+        return {"error": f"context generation failed: {exc}"}
+
+    text = (getattr(resp, "text", "") or "").strip()
+    if not text:
+        return {"error": "model returned empty context"}
+    return {"context_text": text, "model": model}
+
+
 def qa_context_from_floorplan_image_gemini(image_path: str, model: str = "gemini-2.5-pro") -> dict:
     """Create a compact Q&A context blob from a floorplan image (Gemini vision)."""
     p = Path(image_path)
@@ -632,6 +695,24 @@ TOOL_SPECS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "qa_context_from_tactile_image_gemini",
+            "description": (
+                "Extract a compact navigation-focused text context from a tactile map image "
+                "to power Q&A about the map."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "image_path": {"type": "string", "description": "Absolute path to a local image file."},
+                    "model": {"type": "string", "default": "gemini-2.5-pro"},
+                },
+                "required": ["image_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "upload_artifact",
             "description": (
                 "Upload a local file (PNG/JSON) to a public no-auth host and return "
@@ -656,6 +737,7 @@ _DISPATCH = {
     "reconstruct_floorplan": reconstruct_floorplan,
     "tactile_map_from_image_nanobanana": tactile_map_from_image_nanobanana,
     "qa_context_from_floorplan_image_gemini": qa_context_from_floorplan_image_gemini,
+    "qa_context_from_tactile_image_gemini": qa_context_from_tactile_image_gemini,
     "upload_artifact": upload_artifact,
 }
 

@@ -176,20 +176,8 @@ def create_map_from_floorplan_upload(
     file: UploadFile = File(...),
     model: str = "gemini-3-pro-image-preview",
 ) -> TactileMapCreateResponse:
-    # Save upload
+    # Save upload (this should be the *original* floorplan image)
     p = _save_upload(file)
-
-    # Generate tactile PNG
-    t = dispatch(
-        "tactile_map_from_image_nanobanana",
-        {"image_path": str(p), "model": model},
-    )
-    if "error" in t:
-        raise HTTPException(status_code=500, detail=str(t["error"]))
-
-    up = dispatch("upload_artifact", {"file_path": t["png_path"]})
-    if "error" in up:
-        raise HTTPException(status_code=502, detail=str(up["error"]))
 
     # Generate map-specific Q&A context from the original floorplan image
     ctx_res = dispatch(
@@ -201,11 +189,15 @@ def create_map_from_floorplan_upload(
 
     map_id = uuid.uuid4().hex[:16]
     metadata = {"room_name": (file.filename or "Floorplan"), "space_name": map_id}
+    # Optional: upload the original image so the QR page can link to it
+    up_src = dispatch("upload_artifact", {"file_path": str(p)})
+    if "error" in up_src:
+        raise HTTPException(status_code=502, detail=str(up_src["error"]))
     store.put_map(
         map_id=map_id,
         layout_2d=None,
         metadata=metadata,
-        tactile_png_url=up["url"],
+        tactile_png_url=up_src["url"],
         context_text=str(ctx_res.get("context_text") or ""),
     )
 
@@ -214,7 +206,48 @@ def create_map_from_floorplan_upload(
         map_id=map_id,
         voice_url=f"{public_base}/m/{map_id}/voice",
         chat_url=f"{public_base}/m/{map_id}",
-        tactile_png_url=up["url"],
+        tactile_png_url=up_src["url"],
+    )
+
+
+@app.post("/maps/from-tactile-upload", response_model=TactileMapCreateResponse)
+def create_map_from_tactile_upload(
+    request: Request,
+    file: UploadFile = File(...),
+) -> TactileMapCreateResponse:
+    """
+    Fast path: user already has a tactile PNG (NanoBanana output).
+    We skip image generation and only create per-map Q&A context + broadcast URLs.
+    """
+    p = _save_upload(file)
+
+    up_tactile = dispatch("upload_artifact", {"file_path": str(p)})
+    if "error" in up_tactile:
+        raise HTTPException(status_code=502, detail=str(up_tactile["error"]))
+
+    ctx_res = dispatch(
+        "qa_context_from_tactile_image_gemini",
+        {"image_path": str(p), "model": "gemini-2.5-pro"},
+    )
+    if "error" in ctx_res:
+        raise HTTPException(status_code=500, detail=str(ctx_res["error"]))
+
+    map_id = uuid.uuid4().hex[:16]
+    metadata = {"room_name": (file.filename or "Tactile Map"), "space_name": map_id}
+    store.put_map(
+        map_id=map_id,
+        layout_2d=None,
+        metadata=metadata,
+        tactile_png_url=up_tactile["url"],
+        context_text=str(ctx_res.get("context_text") or ""),
+    )
+
+    public_base = BASE_URL or str(request.base_url).rstrip("/")
+    return TactileMapCreateResponse(
+        map_id=map_id,
+        voice_url=f"{public_base}/m/{map_id}/voice",
+        chat_url=f"{public_base}/m/{map_id}",
+        tactile_png_url=up_tactile["url"],
     )
 
 
