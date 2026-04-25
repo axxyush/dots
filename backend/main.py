@@ -26,7 +26,7 @@ except Exception:
 from agents.tools import dispatch  # noqa: E402
 from agents.roomplan_tools import tactile_map_from_roomplan_json, upload_artifact as upload_roomplan_artifact  # noqa: E402
 
-from backend.layout_brief import build_system_prompt  # noqa: E402
+from backend.layout_brief import build_system_prompt, build_system_prompt_from_context  # noqa: E402
 from backend.map_store import MapStore  # noqa: E402
 
 app = FastAPI(title="dots backend", version="0.1.0")
@@ -52,6 +52,13 @@ class UrlRequest(BaseModel):
 class TactileResponse(BaseModel):
     tactile_png_url: str
     tactile_png_path: str
+
+
+class TactileMapCreateResponse(BaseModel):
+    map_id: str
+    voice_url: str
+    chat_url: str
+    tactile_png_url: str
 
 
 class RoomplanMapRequest(BaseModel):
@@ -117,6 +124,52 @@ def tactile_from_url(req: UrlRequest) -> TactileResponse:
     return TactileResponse(tactile_png_url=up["url"], tactile_png_path=t["png_path"])
 
 
+@app.post("/maps/from-floorplan-url", response_model=TactileMapCreateResponse)
+def create_map_from_floorplan_url(req: UrlRequest, request: Request) -> TactileMapCreateResponse:
+    # Download original
+    dl = dispatch("download_image", {"url": req.image_url})
+    if "error" in dl:
+        raise HTTPException(status_code=400, detail=str(dl["error"]))
+
+    # Generate tactile PNG
+    t = dispatch(
+        "tactile_map_from_image_nanobanana",
+        {"image_path": dl["image_path"], "model": req.model},
+    )
+    if "error" in t:
+        raise HTTPException(status_code=500, detail=str(t["error"]))
+
+    up = dispatch("upload_artifact", {"file_path": t["png_path"]})
+    if "error" in up:
+        raise HTTPException(status_code=502, detail=str(up["error"]))
+
+    # Generate map-specific Q&A context from the original floorplan image
+    ctx_res = dispatch(
+        "qa_context_from_floorplan_image_gemini",
+        {"image_path": dl["image_path"], "model": "gemini-2.5-pro"},
+    )
+    if "error" in ctx_res:
+        raise HTTPException(status_code=500, detail=str(ctx_res["error"]))
+
+    map_id = uuid.uuid4().hex[:16]
+    metadata = {"room_name": "Floorplan", "space_name": map_id}
+    store.put_map(
+        map_id=map_id,
+        layout_2d=None,
+        metadata=metadata,
+        tactile_png_url=up["url"],
+        context_text=str(ctx_res.get("context_text") or ""),
+    )
+
+    public_base = BASE_URL or str(request.base_url).rstrip("/")
+    return TactileMapCreateResponse(
+        map_id=map_id,
+        voice_url=f"{public_base}/m/{map_id}/voice",
+        chat_url=f"{public_base}/m/{map_id}",
+        tactile_png_url=up["url"],
+    )
+
+
 @app.post("/tactile/from-upload", response_model=TactileResponse)
 def tactile_from_upload(
     file: UploadFile = File(...),
@@ -171,7 +224,11 @@ def map_chat_page(map_id: str) -> str:
     if not rec:
         raise HTTPException(status_code=404, detail="map not found")
 
-    pdf_link = f'<p><a href="{rec.tactile_pdf_url}">Download tactile PDF</a></p>' if rec.tactile_pdf_url else ""
+    links = ""
+    if rec.tactile_pdf_url:
+        links += f'<p><a href="{rec.tactile_pdf_url}">Download tactile PDF</a></p>'
+    if rec.tactile_png_url:
+        links += f'<p><a href="{rec.tactile_png_url}">Download tactile PNG</a></p>'
 
     # Tiny no-build chat UI.
     return f"""
@@ -191,7 +248,7 @@ def map_chat_page(map_id: str) -> str:
   </head>
   <body>
     <h2>Ask about this tactile map</h2>
-    {pdf_link}
+    {links}
     <p><a href="/m/{map_id}/voice">Open voice mode</a></p>
     <div id="log"></div>
     <div class="row">
@@ -365,7 +422,12 @@ def map_voice_session(map_id: str) -> VoiceSessionResponse:
     if not (ELEVENLABS_AGENT_ID or "").strip():
         raise HTTPException(status_code=500, detail="ELEVENLABS_AGENT_ID not set on server")
 
-    system_prompt = build_system_prompt(rec.layout_2d, rec.metadata)
+    if rec.context_text:
+        system_prompt = build_system_prompt_from_context(rec.context_text, rec.metadata)
+    elif rec.layout_2d:
+        system_prompt = build_system_prompt(rec.layout_2d, rec.metadata)
+    else:
+        raise HTTPException(status_code=500, detail="map has no context")
     first_message = "Hi — ask me anything about this tactile map."
 
     resp = requests.get(
@@ -412,7 +474,12 @@ def map_chat(map_id: str, req: ChatRequest) -> ChatResponse:
     session_id = (req.session_id or "").strip() or uuid.uuid4().hex[:16]
     prior = store.get_chat_messages(map_id=map_id, session_id=session_id)
 
-    system = build_system_prompt(rec.layout_2d, rec.metadata)
+    if rec.context_text:
+        system = build_system_prompt_from_context(rec.context_text, rec.metadata)
+    elif rec.layout_2d:
+        system = build_system_prompt(rec.layout_2d, rec.metadata)
+    else:
+        raise HTTPException(status_code=500, detail="map has no context")
     messages = [{"role": "system", "content": system}]
 
     # Keep a short window for cost and latency.
