@@ -38,6 +38,23 @@ struct ResultsView: View {
     @State private var pipelineStep: String = "Uploading scan…"
     @State private var pollingTask: Task<Void, Never>?
 
+    // Report hub + voice agent (matches the floor-plan flow)
+    @State private var showReportHub = false
+    @State private var showTalkToAgent = false
+
+    private var completedRoomId: String? {
+        if case .complete(let roomId, _, _, _) = uploadState { return roomId }
+        return nil
+    }
+    private var completedPdfUrl: String? {
+        if case .complete(_, let pdfUrl, _, _) = uploadState { return pdfUrl }
+        return nil
+    }
+    private var completedRecommendationsUrl: String? {
+        if case .complete(_, _, _, let recsUrl) = uploadState { return recsUrl }
+        return nil
+    }
+
     init(capturedRoom: CapturedRoom, scanDuration: TimeInterval, scanManager: ScanManager, onNewScan: @escaping () -> Void) {
         self.capturedRoom = capturedRoom
         self.exportData = RoomExporter.export(room: capturedRoom, scanDuration: scanDuration)
@@ -86,6 +103,28 @@ struct ResultsView: View {
                 }
             }
             .sheet(isPresented: $showingShare) { shareSheet }
+            .navigationDestination(isPresented: $showReportHub) {
+                if let roomId = completedRoomId {
+                    DotsReportHubView(
+                        roomId: roomId,
+                        pdfUrl: completedPdfUrl,
+                        recommendationsUrl: completedRecommendationsUrl,
+                        onTalkToAgent: { showTalkToAgent = true }
+                    )
+                } else {
+                    Text("Report unavailable")
+                        .foregroundStyle(DotsTheme.primaryText)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(DotsTheme.background)
+                }
+            }
+            .fullScreenCover(isPresented: $showTalkToAgent) {
+                if let roomId = completedRoomId {
+                    TalkToAgentView(roomId: roomId) {
+                        showTalkToAgent = false
+                    }
+                }
+            }
         }
     }
 
@@ -339,42 +378,55 @@ struct ResultsView: View {
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
 
-            if let pdfUrl = pdfUrl,
-               let url = URL(string: BackendClient.rewriteFileUrl(pdfUrl)) {
-                Button {
-                    UIApplication.shared.open(url)
-                } label: {
-                    HStack {
-                        Image(systemName: "doc.text.fill")
-                            .foregroundColor(.white)
-                        Text("View Braille PDF")
-                            .foregroundColor(.white)
-                            .fontWeight(.semibold)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 12)
-                    .background(Color.blue)
-                    .cornerRadius(10)
-                }
-            }
+            Text("Open the report hub to view the ADA feedback report, the Braille map PDF, or talk to the voice agent.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
-            if let audioUrl = audioUrl,
-               let url = URL(string: BackendClient.rewriteFileUrl(audioUrl)) {
-                Button {
-                    UIApplication.shared.open(url)
-                } label: {
-                    HStack {
-                        Image(systemName: "headphones.circle.fill")
-                            .foregroundColor(.white)
-                        Text("Listen to Audio Walkthrough")
-                            .foregroundColor(.white)
-                            .fontWeight(.semibold)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 12)
-                    .background(Color.purple)
-                    .cornerRadius(10)
+            Button {
+                showReportHub = true
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "checklist")
+                    Text("Open Report Hub")
+                        .fontWeight(.semibold)
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.7))
                 }
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+                .padding(.horizontal, 16)
+                .background(
+                    LinearGradient(
+                        colors: [Color.blue, Color.purple],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                )
+                .cornerRadius(12)
+            }
+            .accessibilityLabel("Open report hub")
+            .accessibilityHint("Shows the ADA report, Braille map, and voice agent for this scan.")
+
+            Button {
+                showTalkToAgent = true
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "waveform.and.mic")
+                    Text("Talk to the Agent")
+                        .fontWeight(.medium)
+                    Spacer()
+                }
+                .foregroundStyle(.primary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+                .padding(.horizontal, 16)
+                .background(
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(Color.gray.opacity(0.15))
+                )
             }
 
             if pdfUrl == nil && audioUrl == nil {

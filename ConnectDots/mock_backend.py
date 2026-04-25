@@ -21,6 +21,8 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import base64
+import json
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -40,6 +42,17 @@ try:
         load_dotenv(_env_path)
 except Exception:
     pass
+
+USE_CLOUDINARY = os.getenv("Set_cloudinary", "false").lower() == "true"
+if USE_CLOUDINARY:
+    import cloudinary
+    import cloudinary.uploader
+    cloudinary.config(
+        cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+        api_key=os.getenv("CLOUDINARY_API_KEY"),
+        api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+        secure=True,
+    )
 
 app = FastAPI(title="BrailleMap Mock Backend", version="2.0.0")
 
@@ -179,6 +192,38 @@ async def upload_scan(payload: ScanUpload) -> UploadResponse:
 
     _print_receipt(room_id, payload)
 
+    def _upload_to_cloudinary_bg():
+        if not USE_CLOUDINARY:
+            return
+        try:
+            json_str = json.dumps(scan)
+            b64_json = base64.b64encode(json_str.encode('utf-8')).decode('utf-8')
+            res = cloudinary.uploader.upload(
+                f"data:application/json;base64,{b64_json}",
+                resource_type="raw",
+                folder="braillemap/scans",
+                public_id=f"scan_{room_id}.json",
+            )
+            rooms_db[room_id]["cloudinary_scan_url"] = res.get("secure_url")
+            
+            photo_urls = []
+            for i, p in enumerate(payload.photos):
+                img_data = p.image_base64
+                if not img_data.startswith("data:"):
+                    img_data = f"data:image/jpeg;base64,{img_data}"
+                pres = cloudinary.uploader.upload(
+                    img_data,
+                    folder=f"braillemap/scans/{room_id}",
+                    public_id=f"photo_{i}",
+                )
+                photo_urls.append(pres.get("secure_url"))
+            rooms_db[room_id]["cloudinary_photo_urls"] = photo_urls
+            print(f"  ✓ Uploaded scan data and {len(photo_urls)} photos to Cloudinary for room {room_id}")
+        except Exception as e:
+            print(f"  ✗ Cloudinary scan upload failed: {e}")
+
+    threading.Thread(target=_upload_to_cloudinary_bg, daemon=True).start()
+
     # Auto-trigger the agent pipeline in the background
     def _trigger_bg():
         try:
@@ -242,8 +287,34 @@ async def upload_floorplan(payload: FloorPlanUpload) -> UploadResponse:
     print(f"  Image size: {len(payload.image_base64)} chars (base64)")
     print(divider + "\n")
 
+    cloudinary_done = threading.Event()
+
+    def _upload_floorplan_bg():
+        if not USE_CLOUDINARY:
+            cloudinary_done.set()
+            return
+        try:
+            img_data = payload.image_base64
+            if not img_data.startswith("data:"):
+                img_data = f"data:image/jpeg;base64,{img_data}"
+            res = cloudinary.uploader.upload(
+                img_data,
+                folder="braillemap/floorplans",
+                public_id=f"floorplan_{room_id}",
+            )
+            rooms_db[room_id]["cloudinary_floorplan_url"] = res.get("secure_url")
+            print(f"  ✓ Uploaded floorplan to Cloudinary for room {room_id}")
+        except Exception as e:
+            print(f"  ✗ Cloudinary floorplan upload failed: {e}")
+        finally:
+            cloudinary_done.set()
+
+    threading.Thread(target=_upload_floorplan_bg, daemon=True).start()
+
     # Auto-trigger floor plan analysis uAgent in background
+    # MUST wait for Cloudinary upload to finish first so the agent can read the URL
     def _analyze_bg():
+        cloudinary_done.wait(timeout=60)  # wait up to 60s for Cloudinary
         try:
             from trigger import trigger_floorplan_pipeline
             trigger_floorplan_pipeline(room_id)
@@ -401,6 +472,28 @@ async def start_voice_session(room_id: str):
     }
 
 
+@app.get("/conversations")
+async def get_conversations():
+    agent_id = os.getenv("ELEVENLABS_AGENT_ID")
+    if not agent_id:
+        raise HTTPException(
+            status_code=500,
+            detail="ELEVENLABS_AGENT_ID not configured on the server.",
+        )
+    try:
+        from voice_session import fetch_conversations, fetch_conversation_transcript
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"voice_session import failed: {exc}"
+        )
+    
+    convs = fetch_conversations(agent_id)
+    # Fetch transcripts for the recent conversations (limit to 10 for performance)
+    results = []
+    for c in convs[:10]:
+        transcript = fetch_conversation_transcript(c["conversation_id"])
+        results.append(transcript)
+    return {"conversations": results}
 # ── Entry Point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

@@ -92,3 +92,36 @@ def mint_conversation_token(agent_id: str) -> str:
     if not token:
         raise RuntimeError(f"ElevenLabs token response missing 'token': {body}")
     return token
+
+
+def fetch_conversations(agent_id: str) -> list[Dict[str, Any]]:
+    """Fetch the list of recent conversations for this agent."""
+    if not ELEVENLABS_API_KEY:
+        return []
+    
+    url = "https://api.elevenlabs.io/v1/convai/conversations"
+    resp = requests.get(
+        url,
+        params={"agent_id": agent_id},
+        headers={"xi-api-key": ELEVENLABS_API_KEY},
+        timeout=10,
+    )
+    if not resp.ok:
+        return []
+    return resp.json().get("conversations", [])
+
+
+def fetch_conversation_transcript(conversation_id: str) -> Dict[str, Any]:
+    """Fetch the full transcript and metadata for a specific conversation."""
+    if not ELEVENLABS_API_KEY:
+        return {}
+        
+    url = f"https://api.elevenlabs.io/v1/convai/conversations/{conversation_id}"
+    resp = requests.get(
+        url,
+        headers={"xi-api-key": ELEVENLABS_API_KEY},
+        timeout=10,
+    )
+    if not resp.ok:
+        return {}
+    return resp.json()
