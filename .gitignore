@@ -60,3 +60,30 @@ fastlane/report.xml
 fastlane/Preview.html
 fastlane/screenshots/**/*.png
 fastlane/test_output
+
+# ── Local env / secrets ──────────────────────────────────────────────────────
+.env
+.env.*
+*.env
+
+# ── Python virtualenvs ───────────────────────────────────────────────────────
+.venv/
+venv/
+.python-version
+
+# ── Python caches / build artifacts ──────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# ── OS / editor junk ─────────────────────────────────────────────────────────
+.DS_Store
