@@ -50,29 +50,8 @@ except Exception as _gemini_import_exc:  # pragma: no cover
         "Gemini labeling unavailable: %s", _gemini_import_exc
     )
 
-try:
-    from cv_openai_refine import (  # noqa: E402
-        label_regions_global as _openai_label_global,
-        find_missed_regions as _openai_find_missed,
-    )
-    _OPENAI_IMPORT_OK = True
-except Exception as _openai_import_exc:  # pragma: no cover
-    _openai_label_global = None  # type: ignore
-    _openai_find_missed = None  # type: ignore
-    _OPENAI_IMPORT_OK = False
-    logging.getLogger("sensegrid.tools").warning(
-        "OpenAI labeling unavailable: %s", _openai_import_exc
-    )
-
-try:
-    from llm_floorplan import parse_floorplan_with_llm  # noqa: E402
-    _LLM_PARSE_IMPORT_OK = True
-except Exception as _llm_parse_import_exc:  # pragma: no cover
-    parse_floorplan_with_llm = None  # type: ignore
-    _LLM_PARSE_IMPORT_OK = False
-    logging.getLogger("sensegrid.tools").warning(
-        "End-to-end LLM parser unavailable: %s", _llm_parse_import_exc
-    )
+_LLM_PARSE_IMPORT_OK = False
+parse_floorplan_with_llm = None  # type: ignore
 
 log = logging.getLogger("sensegrid.tools")
 
@@ -99,7 +78,9 @@ Hard requirements:
   - icons/markers: simple line icons are allowed
 - Preserve topology: rooms, walls, doors, and corridors must stay in correct relative position.
 - Add clear door gaps. Mark the main entrance with a clear star marker.
-- Add numbered markers for key rooms/objects and include an embedded legend panel mapping numbers/patterns/icons → labels.
+- Do NOT include numeric labels (no digits 0-9) and do NOT include a numbered legend.
+- If you include any labels at all, they must be in **Braille only** (no Latin letters, no digits).
+- Prefer an unnumbered legend that uses distinct patterns/symbols only (e.g., hatch = seating, dots = concourse, thick line = wall).
 - No decorative elements, no extra branding. Text should be minimal and aligned.
 - Printable and legible at A4 size.
 
@@ -128,13 +109,10 @@ def tactile_map_from_image_nanobanana(image_path: str, model: str = "gemini-3-pr
         mime = "image/png" if p.suffix.lower() == ".png" else "image/jpeg"
         img_part = types.Part.from_bytes(data=img_bytes, mime_type=mime)
         client = genai.Client(api_key=api_key)
+        # Match the local test script behavior: don't force aspect/size unless needed.
         cfg = types.GenerateContentConfig(
             response_modalities=["TEXT", "IMAGE"],
             temperature=0.0,
-            image_config=types.ImageConfig(
-                aspect_ratio="4:3",
-                image_size="2K",
-            ),
         )
         resp = client.models.generate_content(
             model=model,
@@ -229,7 +207,7 @@ def parse_floorplan(image_path: str) -> dict:
         return {"error": f"image not found: {image_path}"}
 
     if not _CV2_OK or cv2 is None:
-        return {"error": "OpenCV not installed; use parse_floorplan_llm instead."}
+        return {"error": "OpenCV not installed."}
 
     global extract_rooms_cv_multiscale, regions_to_floor_objects
     if extract_rooms_cv_multiscale is None or regions_to_floor_objects is None:
@@ -245,10 +223,7 @@ def parse_floorplan(image_path: str) -> dict:
 
     regions, _ = extract_rooms_cv_multiscale(img)
 
-    # Labeling pipeline: prefer OpenAI (GPT-4o vision) when the key is set,
-    # fall back to Gemini, then leave rooms as "unknown" if neither is
-    # available.  We record the provider actually used so the caller can
-    # surface it in the UI / debug logs.
+    # Labeling pipeline: Gemini only (no OpenAI dependency).
     labeling_provider = "none"
     labeling_model: str | None = None
     labeling_status = "skipped"
@@ -256,57 +231,13 @@ def parse_floorplan(image_path: str) -> dict:
     labeling_labeled = 0
     gapfill_added = 0
 
-    openai_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
     gemini_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
 
     if not regions:
         labeling_error = "no regions to label"
-    elif openai_key and _OPENAI_IMPORT_OK:
-        labeling_provider = "openai"
-        labeling_model = os.environ.get("OPENAI_LABEL_MODEL", "gpt-4o")
-        try:
-            log.info("parse_floorplan: calling OpenAI global labeling via %s…", labeling_model)
-            regions = _openai_label_global(
-                img, regions, model_name=labeling_model, api_key=openai_key,
-            )
-            labeling_labeled = sum(
-                1 for r in regions
-                if (r.label_text or (r.label_hint and r.label_hint != "unknown"))
-            )
-            labeling_status = "ok" if labeling_labeled > 0 else "returned_no_labels"
-            log.info(
-                "parse_floorplan: OpenAI labeled %d/%d rooms (%s)",
-                labeling_labeled, len(regions), labeling_status,
-            )
 
-            # Gap-fill: ask OpenAI for rooms the CV missed. Opt-in (default on
-            # for OpenAI because it costs ~1 extra call).
-            if os.environ.get("OPENAI_GAPFILL", "1").lower() not in ("0", "false", "no"):
-                try:
-                    extra = _openai_find_missed(
-                        img, regions,
-                        model_name=os.environ.get("OPENAI_GAPFILL_MODEL", labeling_model),
-                        api_key=openai_key,
-                    )
-                    if extra:
-                        regions = list(regions) + list(extra)
-                        gapfill_added = len(extra)
-                        log.info("parse_floorplan: OpenAI gap-fill added %d regions", gapfill_added)
-                except Exception as exc:
-                    log.warning("parse_floorplan: OpenAI gap-fill raised %s", exc)
-        except Exception as exc:
-            log.warning("parse_floorplan: OpenAI labeling raised %s — falling back to Gemini", exc)
-            labeling_status = "error"
-            labeling_error = f"openai: {exc}"
-            labeling_provider = "openai_failed"
-
-    # Gemini fallback path: either no OpenAI key, or OpenAI raised.
-    if (
-        labeling_provider in ("none", "openai_failed")
-        and gemini_key
-        and _GEMINI_IMPORT_OK
-        and regions
-    ):
+    # Gemini labeling path (only).
+    if gemini_key and _GEMINI_IMPORT_OK and regions:
         try:
             from google import genai  # type: ignore
 
@@ -333,10 +264,10 @@ def parse_floorplan(image_path: str) -> dict:
             labeling_error = f"gemini: {exc}"
 
     if labeling_provider == "none" and not labeling_error:
-        if not openai_key and not gemini_key:
-            labeling_error = "no labeling key set (OPENAI_API_KEY / GEMINI_API_KEY)"
-        elif not (_OPENAI_IMPORT_OK or _GEMINI_IMPORT_OK):
-            labeling_error = "no labeling module importable"
+        if not gemini_key:
+            labeling_error = "GEMINI_API_KEY not set"
+        elif not _GEMINI_IMPORT_OK:
+            labeling_error = "Gemini labeling module unavailable"
 
     # Re-stamp IDs so output is consistent after the gap-fill merge.
     from cv_rooms import RoomRegion  # local import to avoid circular
@@ -463,74 +394,6 @@ def _finalize_floor_plan(
     return out
 
 
-# ── Tool 2b: parse_floorplan_llm (OpenAI end-to-end) ─────────────────────────
-
-
-def parse_floorplan_llm(image_path: str) -> dict:
-    """End-to-end floor-plan parse using an OpenAI vision model (GPT-4o).
-
-    Bypasses the OpenCV region extractor entirely and asks the LLM to parse
-    the full plan in one call. This tends to produce more accurate rooms
-    and labels on well-drawn architectural plans.
-
-    Returns a dict shaped like `parse_floorplan` so the agent can treat both
-    tools interchangeably. Callers should fall back to `parse_floorplan` on
-    error.
-    """
-    p = Path(image_path)
-    if not p.exists():
-        return {"error": f"image not found: {image_path}"}
-    if not _LLM_PARSE_IMPORT_OK or parse_floorplan_with_llm is None:
-        return {"error": "llm_floorplan module unavailable"}
-    if not (os.environ.get("OPENAI_API_KEY") or "").strip():
-        return {"error": "OPENAI_API_KEY not set"}
-
-    try:
-        parsed = parse_floorplan_with_llm(
-            str(p),
-            source_image_name=p.name,
-        )
-    except Exception as exc:
-        log.warning("parse_floorplan_llm: LLM extraction failed: %s", exc)
-        return {"error": f"LLM extraction failed: {exc}"}
-
-    floor_plan = parsed["floor_plan"]
-    building_type = parsed.get("building_type", "unknown")
-    dims = floor_plan.get("dimensions_px") or {}
-    w = int(dims.get("width", 0))
-    h = int(dims.get("height", 0))
-    objs = list(floor_plan.get("rooms", []))
-
-    base = _finalize_floor_plan(
-        floor_plan=floor_plan,
-        image_path_obj=p,
-        image_width=w,
-        image_height=h,
-        objs=objs,
-    )
-    base.update(
-        {
-            "labeling_provider": "openai_end_to_end",
-            "labeling_model": os.environ.get("OPENAI_PARSE_MODEL", "gpt-4o"),
-            "labeling_status": "ok" if objs else "returned_no_rooms",
-            "labeling_rooms_labeled": sum(
-                1 for o in objs if o.get("type") and o["type"] != "unknown"
-            ),
-            "labeling_gapfill_added": 0,
-            "building_type": building_type,
-        }
-    )
-    log.info(
-        "parse_floorplan_llm: %s → %d rooms, %d corridors, %d verticals (building=%s)",
-        image_path,
-        len(objs),
-        len(floor_plan.get("corridors", [])),
-        len(floor_plan.get("verticals", [])),
-        building_type,
-    )
-    return base
-
-
 # ── Tool 3: reconstruct_floorplan ────────────────────────────────────────────
 
 
@@ -654,24 +517,6 @@ TOOL_SPECS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "parse_floorplan_llm",
-            "description": (
-                "End-to-end floor-plan parse using an OpenAI vision model. Preferred "
-                "over parse_floorplan when OPENAI_API_KEY is available — tends to "
-                "produce more accurate rooms and labels for architectural plans."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "image_path": {"type": "string", "description": "Absolute path to a local image file."},
-                },
-                "required": ["image_path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "reconstruct_floorplan",
             "description": (
                 "Render a parsed floor-plan JSON back to a PNG so the user can "
@@ -728,7 +573,6 @@ TOOL_SPECS: list[dict] = [
 _DISPATCH = {
     "download_image": download_image,
     "parse_floorplan": parse_floorplan,
-    "parse_floorplan_llm": parse_floorplan_llm,
     "reconstruct_floorplan": reconstruct_floorplan,
     "tactile_map_from_image_nanobanana": tactile_map_from_image_nanobanana,
     "upload_artifact": upload_artifact,

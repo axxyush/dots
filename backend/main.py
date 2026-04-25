@@ -34,11 +34,6 @@ class TactileResponse(BaseModel):
     tactile_png_path: str
 
 
-class ParseResponse(BaseModel):
-    json_url: str
-    json_path: str
-
-
 @app.get("/health")
 def health() -> dict:
     return {"ok": True}
@@ -87,25 +82,4 @@ def tactile_from_upload(
     if "error" in up:
         raise HTTPException(status_code=502, detail=str(up["error"]))
     return TactileResponse(tactile_png_url=up["url"], tactile_png_path=t["png_path"])
-
-
-@app.post("/parse/from-url", response_model=ParseResponse)
-def parse_from_url(image_url: str) -> ParseResponse:
-    """
-    Parse a floorplan image into structured JSON using the LLM parser.
-    Requires OPENAI_API_KEY to be set (see agents.tools.parse_floorplan_llm).
-    """
-    dl = dispatch("download_image", {"url": image_url})
-    if "error" in dl:
-        raise HTTPException(status_code=400, detail=str(dl["error"]))
-
-    parsed = dispatch("parse_floorplan_llm", {"image_path": dl["image_path"]})
-    if "error" in parsed:
-        raise HTTPException(status_code=500, detail=str(parsed["error"]))
-
-    up = dispatch("upload_artifact", {"file_path": parsed["json_path"]})
-    if "error" in up:
-        raise HTTPException(status_code=502, detail=str(up["error"]))
-
-    return ParseResponse(json_url=up["url"], json_path=parsed["json_path"])
 
