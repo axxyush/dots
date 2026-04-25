@@ -141,9 +141,37 @@ def qa_context_from_tactile_image_gemini(image_path: str, model: str = "gemini-2
     except Exception as exc:
         return {"error": f"Gemini client not available: {exc}"}
 
+    def _guess_mime(path: Path) -> str:
+        suf = path.suffix.lower()
+        if suf in {".jpg", ".jpeg"}:
+            return "image/jpeg"
+        if suf in {".webp"}:
+            return "image/webp"
+        if suf in {".gif"}:
+            return "image/gif"
+        return "image/png"
+
+    def _extract_text(resp_obj) -> str:
+        t = (getattr(resp_obj, "text", "") or "").strip()
+        if t:
+            return t
+        for cand in getattr(resp_obj, "candidates", []) or []:
+            content = getattr(cand, "content", None)
+            if not content:
+                continue
+            for part in getattr(content, "parts", []) or []:
+                pt = (getattr(part, "text", "") or "").strip()
+                if pt:
+                    return pt
+        for part in getattr(resp_obj, "parts", []) or []:
+            pt = (getattr(part, "text", "") or "").strip()
+            if pt:
+                return pt
+        return ""
+
     client = genai.Client(api_key=api_key)
     try:
-        img_part = types.Part.from_bytes(data=p.read_bytes(), mime_type="image/png")
+        img_part = types.Part.from_bytes(data=p.read_bytes(), mime_type=_guess_mime(p))
         resp = client.models.generate_content(
             model=model,
             contents=[
@@ -156,6 +184,7 @@ def qa_context_from_tactile_image_gemini(image_path: str, model: str = "gemini-2
                 )
             ],
             config=types.GenerateContentConfig(
+                response_mime_type="text/plain",
                 temperature=0.1,
                 max_output_tokens=1200,
             ),
@@ -163,7 +192,7 @@ def qa_context_from_tactile_image_gemini(image_path: str, model: str = "gemini-2
     except Exception as exc:
         return {"error": f"context generation failed: {exc}"}
 
-    text = (getattr(resp, "text", "") or "").strip()
+    text = _extract_text(resp)
     if not text:
         return {"error": "model returned empty context"}
     return {"context_text": text, "model": model}
@@ -185,9 +214,37 @@ def qa_context_from_floorplan_image_gemini(image_path: str, model: str = "gemini
     except Exception as exc:
         return {"error": f"Gemini client not available: {exc}"}
 
+    def _guess_mime(path: Path) -> str:
+        suf = path.suffix.lower()
+        if suf in {".jpg", ".jpeg"}:
+            return "image/jpeg"
+        if suf in {".webp"}:
+            return "image/webp"
+        if suf in {".gif"}:
+            return "image/gif"
+        return "image/png"
+
+    def _extract_text(resp_obj) -> str:
+        t = (getattr(resp_obj, "text", "") or "").strip()
+        if t:
+            return t
+        for cand in getattr(resp_obj, "candidates", []) or []:
+            content = getattr(cand, "content", None)
+            if not content:
+                continue
+            for part in getattr(content, "parts", []) or []:
+                pt = (getattr(part, "text", "") or "").strip()
+                if pt:
+                    return pt
+        for part in getattr(resp_obj, "parts", []) or []:
+            pt = (getattr(part, "text", "") or "").strip()
+            if pt:
+                return pt
+        return ""
+
     client = genai.Client(api_key=api_key)
     try:
-        img_part = types.Part.from_bytes(data=p.read_bytes(), mime_type="image/png")
+        img_part = types.Part.from_bytes(data=p.read_bytes(), mime_type=_guess_mime(p))
         resp = client.models.generate_content(
             model=model,
             contents=[
@@ -200,6 +257,7 @@ def qa_context_from_floorplan_image_gemini(image_path: str, model: str = "gemini
                 )
             ],
             config=types.GenerateContentConfig(
+                response_mime_type="text/plain",
                 temperature=0.1,
                 max_output_tokens=1200,
             ),
@@ -207,7 +265,7 @@ def qa_context_from_floorplan_image_gemini(image_path: str, model: str = "gemini
     except Exception as exc:
         return {"error": f"context generation failed: {exc}"}
 
-    text = (getattr(resp, "text", "") or "").strip()
+    text = _extract_text(resp)
     if not text:
         return {"error": "model returned empty context"}
     return {"context_text": text, "model": model}
