@@ -1,0 +1,470 @@
+"""SenseGrid — Fetch.ai chat agent for floor-plan parsing with a test-FET paywall.
+
+Flow (deterministic state machine; payment is NOT trusted to an LLM):
+  1. User sends a ChatMessage with one or more http(s) floor-plan URLs.
+  2. Agent quotes a price in test FET (Dorado), waits for "yes".
+  3. On "yes", parses + renders a BLURRED preview, posts the agent's pay
+     address + a faucet link, and waits for "paid".
+  4. On "paid", verifies the on-chain balance delta against the unique
+     per-session quoted amount; only on success does it deliver the final
+     unblurred PNG + structured JSON.
+
+Run:
+    pip install -r requirements.txt
+    # In .env at repo root:
+    #   GEMINI_API_KEY=...
+    #   SENSEGRID_AGENT_SEED=<any long random phrase, keep stable>
+    #   SENSEGRID_PRICE_PER_PLAN_FET=0.5     # optional, default 0.5
+    #   SENSEGRID_PAYMENT_TIMEOUT_S=600      # optional, default 600
+    python agents/sensegrid_agent.py
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from uuid import uuid4
+
+# Load .env from the repo root BEFORE we read any os.environ values. Without
+# override=False existing shell vars still win, so `export ASI_ONE_API_KEY=...`
+# in your shell keeps working alongside .env.
+try:
+    from dotenv import load_dotenv  # type: ignore
+
+    _REPO_ROOT = Path(__file__).resolve().parents[1]
+    load_dotenv(_REPO_ROOT / ".env", override=False)
+except ImportError:
+    pass  # python-dotenv is optional; env vars can still be set manually.
+
+from uagents import Agent, Context, Protocol
+from uagents_core.contrib.protocols.chat import (
+    ChatAcknowledgement,
+    ChatMessage,
+    EndSessionContent,
+    TextContent,
+    chat_protocol_spec,
+)
+
+from tools import dispatch
+from payment import (
+    GAS_BUFFER_ATESTFET,
+    PAYMENT_TIMEOUT_S,
+    FAUCET_URL,
+    address_balance_atestfet,
+    atestfet_to_fet_str,
+    make_wallet_from_seed,
+    payment_received,
+    quote_for,
+    send_tokens,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+)
+log = logging.getLogger("sensegrid.agent")
+
+
+def _ensure_event_loop() -> None:
+    """Python 3.14+ no longer creates a default event loop implicitly."""
+    try:
+        asyncio.get_running_loop()
+        return
+    except RuntimeError:
+        pass
+
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+
+_ensure_event_loop()
+
+
+# ── Config ───────────────────────────────────────────────────────────────────
+
+AGENT_SEED = os.environ.get(
+    "SENSEGRID_AGENT_SEED",
+    "braille-map-seed-phrase",
+)
+
+# Deterministic "user-proxy" wallet: the agent pays itself on the user's
+# behalf so the demo is fully autonomous. Funded once from the Dorado faucet.
+USER_PROXY_SEED = os.environ.get(
+    "SENSEGRID_USER_SEED",
+    f"{AGENT_SEED}-user-proxy",
+)
+user_wallet = make_wallet_from_seed(USER_PROXY_SEED)
+
+# ── Two-step paywall state machine ───────────────────────────────────────────
+#
+# Payment is settled deterministically in Python. The LLM/ASI:One client is
+# NOT trusted to gate payment — it would happily hallucinate a "paid" status.
+#
+#   idle ─send url(s)─► quoted ─"yes"─► previewed ─"paid" + tx confirmed─► idle
+#                          │                  │
+#                          └─"no"─────────────┴──────────► idle (cancelled)
+
+STATE_IDLE = "idle"
+STATE_QUOTED = "quoted"
+STATE_PREVIEWED = "previewed"
+
+URL_REGEX = re.compile(r"https?://[^\s<>\"]+")
+_MENTION_REGEX = re.compile(r"@\S+")
+_TRAILING_PUNCT = ".,;:!?)\"']"
+
+_YES = {"yes", "y", "proceed", "ok", "okay", "go", "continue", "sure", "confirm", "yep", "yeah"}
+_NO = {"no", "n", "cancel", "stop", "nevermind", "abort", "nope"}
+_PAID = {"paid", "sent", "done"}
+
+
+def _normalize(text: str) -> str:
+    """Strip @mentions and trim — ASI:One prepends @agent1qx... to user replies."""
+    return _MENTION_REGEX.sub("", text).strip()
+
+
+def _extract_urls(text: str) -> list[str]:
+    urls = []
+    for raw in URL_REGEX.findall(text):
+        while raw and raw[-1] in _TRAILING_PUNCT:
+            raw = raw[:-1]
+        if raw:
+            urls.append(raw)
+    seen, out = set(), []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def _intent(text: str) -> str:
+    """Word-set membership beats exact match: tolerates 'yes please',
+    '@agent yes', 'ok lets go', etc."""
+    t = _normalize(text).lower().rstrip(".!?,;:")
+    if not t:
+        return "other"
+    words = set(re.findall(r"[a-z']+", t))
+    if t in _YES or words & _YES:
+        return "yes"
+    if t in _NO or words & _NO:
+        return "no"
+    if words & _PAID or "i paid" in t or "i've paid" in t:
+        return "paid"
+    if URL_REGEX.search(text):
+        return "urls"
+    return "other"
+
+
+def _session_key(sender: str) -> str:
+    return f"sess:{sender}"
+
+
+def _load_session(ctx, sender: str) -> dict:
+    raw = ctx.storage.get(_session_key(sender))
+    if not raw:
+        return {"state": STATE_IDLE}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        return json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {"state": STATE_IDLE}
+
+
+def _save_session(ctx, sender: str, sess: dict) -> None:
+    ctx.storage.set(_session_key(sender), json.dumps(sess))
+
+
+def _clear_session(ctx, sender: str) -> None:
+    ctx.storage.set(_session_key(sender), json.dumps({"state": STATE_IDLE}))
+
+
+def _process_plans(urls: list[str], blurred: bool, logger: logging.Logger) -> tuple[list[str], list[str], dict[str, int], str | None]:
+    """Run download → parse → reconstruct(blurred) → upload for each URL.
+    Returns (json_paths, png_urls, room_summary, error_or_None)."""
+    json_paths: list[str] = []
+    png_urls: list[str] = []
+    room_summary: dict[str, int] = {}
+
+    for url in urls:
+        logger.info("processing %s", url)
+        dl = dispatch("download_image", {"url": url})
+        if "error" in dl:
+            return [], [], {}, f"Couldn't download {url}: {dl['error']}"
+
+        parsed = dispatch("parse_floorplan_llm", {"image_path": dl["image_path"]})
+        if "error" in parsed:
+            logger.warning("LLM extractor failed (%s) — falling back to CV", parsed["error"])
+            parsed = dispatch("parse_floorplan", {"image_path": dl["image_path"]})
+        if "error" in parsed:
+            return [], [], {}, f"Couldn't parse {url}: {parsed['error']}"
+
+        json_paths.append(parsed["json_path"])
+        for k, v in parsed.get("rooms_by_type", {}).items():
+            room_summary[k] = room_summary.get(k, 0) + v
+
+        rec = dispatch("reconstruct_floorplan", {"json_path": parsed["json_path"], "blurred": blurred})
+        if "error" in rec:
+            return [], [], {}, f"Render failed: {rec['error']}"
+
+        up = dispatch("upload_artifact", {"file_path": rec["png_path"]})
+        if "error" in up:
+            return [], [], {}, f"Upload failed: {up['error']}"
+        png_urls.append(up["url"])
+
+    return json_paths, png_urls, room_summary, None
+
+
+def handle_chat(ctx, sender: str, user_text: str) -> str:
+    """Deterministic two-step paywall. See state diagram at top of this section."""
+    sess = _load_session(ctx, sender)
+    state = sess.get("state", STATE_IDLE)
+    intent = _intent(user_text)
+    logger = ctx.logger
+
+    if intent == "no":
+        _clear_session(ctx, sender)
+        return "Cancelled. Send a floor-plan URL whenever you're ready."
+
+    if state != STATE_IDLE and time.time() > sess.get("expires_at", 0):
+        logger.info("session for %s expired — resetting", sender[:12])
+        _clear_session(ctx, sender)
+        sess, state = {"state": STATE_IDLE}, STATE_IDLE
+
+    # Sending a fresh URL while mid-flow re-quotes from scratch.
+    if state != STATE_IDLE and intent == "urls":
+        _clear_session(ctx, sender)
+        sess, state = {"state": STATE_IDLE}, STATE_IDLE
+
+    if state == STATE_IDLE:
+        urls = _extract_urls(user_text)
+        if not urls:
+            return (
+                "Send one or more floor-plan image URLs (http/https). "
+                "I'll quote a price in test FET, show you a blurred preview, "
+                "then deliver the full reconstruction once payment lands."
+            )
+        q = quote_for(len(urls))
+        sess = {
+            "state": STATE_QUOTED,
+            "urls": urls,
+            "quoted_atestfet": q.total_atestfet,
+            "quoted_fet_str": q.total_fet_str,
+            "n_plans": len(urls),
+            "expires_at": time.time() + PAYMENT_TIMEOUT_S,
+        }
+        _save_session(ctx, sender, sess)
+        plural = "s" if len(urls) > 1 else ""
+        return (
+            f"Quote: **{q.total_fet_str} test FET** for {len(urls)} floor plan{plural}.\n\n"
+            f"Reply 'yes' to proceed (you'll see a blurred preview before paying), "
+            f"or 'no' to cancel."
+        )
+
+    if state == STATE_QUOTED:
+        if intent != "yes":
+            return (
+                f"Reply 'yes' to proceed with the quote of "
+                f"{sess['quoted_fet_str']} test FET, or 'no' to cancel."
+            )
+
+        json_paths, blurred_urls, room_summary, err = _process_plans(
+            sess["urls"], blurred=True, logger=logger
+        )
+        if err:
+            _clear_session(ctx, sender)
+            return err
+
+        pay_addr = str(agent.wallet.address())
+        try:
+            start_balance = address_balance_atestfet(pay_addr)
+        except Exception as exc:
+            logger.exception("ledger query failed")
+            _clear_session(ctx, sender)
+            return f"Couldn't reach Fetch.ai testnet ledger: {exc}"
+
+        sess.update(
+            {
+                "state": STATE_PREVIEWED,
+                "json_paths": json_paths,
+                "blurred_urls": blurred_urls,
+                "room_summary": room_summary,
+                "start_balance_atestfet": start_balance,
+                "pay_address": pay_addr,
+                "expires_at": time.time() + PAYMENT_TIMEOUT_S,
+            }
+        )
+        _save_session(ctx, sender, sess)
+
+        rooms_str = ", ".join(f"{k}: {v}" for k, v in sorted(room_summary.items()))
+        previews = "\n".join(f"- {u}" for u in blurred_urls)
+        plural = "s" if len(sess["urls"]) > 1 else ""
+        user_addr = str(user_wallet.address())
+        return (
+            f"Found {sum(room_summary.values())} rooms across {sess['n_plans']} plan{plural} "
+            f"({rooms_str}).\n\n"
+            f"**Blurred preview:**\n{previews}\n\n"
+            f"Reply **'yes'** to authorize payment of **{sess['quoted_fet_str']} test FET** "
+            f"— I'll execute the transfer on-chain (Dorado) automatically and deliver the "
+            f"full reconstruction. Reply 'no' to cancel.\n\n"
+            f"_Demo wallet: `{user_addr}` — top up at {FAUCET_URL}/{user_addr} if needed._"
+        )
+
+    if state == STATE_PREVIEWED:
+        if intent not in {"yes", "paid"}:
+            return (
+                "Reply 'yes' to authorize the autonomous payment, or 'no' to cancel."
+            )
+
+        # Autonomous payment: agent signs + broadcasts the transfer from the
+        # user-proxy wallet to the service wallet.
+        amount = int(sess["quoted_atestfet"])
+        user_addr = str(user_wallet.address())
+        try:
+            user_balance = address_balance_atestfet(user_addr)
+        except Exception as exc:
+            logger.exception("ledger query failed before send")
+            return f"Couldn't reach the ledger: {exc}. Try again in a few seconds."
+
+        if user_balance < amount + GAS_BUFFER_ATESTFET:
+            return (
+                f"Demo user wallet `{user_addr}` doesn't have enough test FET "
+                f"(has {atestfet_to_fet_str(user_balance)}, needs ≥ "
+                f"{atestfet_to_fet_str(amount + GAS_BUFFER_ATESTFET)} including gas).\n\n"
+                f"Top it up once at {FAUCET_URL}/{user_addr} and reply 'yes' again."
+            )
+
+        try:
+            tx_hash = send_tokens(user_wallet, sess["pay_address"], amount)
+            logger.info("autonomous payment broadcast: %s atestfet → %s (tx %s)",
+                        amount, sess["pay_address"], tx_hash)
+        except Exception as exc:
+            logger.exception("send_tokens failed")
+            return f"Payment broadcast failed: {exc}. Reply 'yes' to retry or 'no' to cancel."
+
+        try:
+            received, current = payment_received(
+                sess["pay_address"],
+                int(sess["start_balance_atestfet"]),
+                amount,
+            )
+        except Exception as exc:
+            logger.exception("ledger query failed during verify")
+            return (
+                f"Tx {tx_hash} broadcast but couldn't verify on-chain receipt: {exc}. "
+                f"Check the Dorado explorer and reply 'yes' to retry."
+            )
+
+        if not received:
+            got = max(0, current - int(sess["start_balance_atestfet"]))
+            return (
+                f"Tx {tx_hash} broadcast but balance hasn't reflected yet "
+                f"(saw {atestfet_to_fet_str(got)} of {sess['quoted_fet_str']} expected). "
+                f"Reply 'yes' in a few seconds to retry."
+            )
+
+        # Render unblurred + upload + deliver.
+        final_urls: list[str] = []
+        json_urls: list[str] = []
+        for jp in sess["json_paths"]:
+            rec = dispatch("reconstruct_floorplan", {"json_path": jp, "blurred": False})
+            if "error" in rec:
+                return f"Render failed after payment: {rec['error']}"
+            up = dispatch("upload_artifact", {"file_path": rec["png_path"]})
+            if "error" in up:
+                return f"Upload failed after payment: {up['error']}"
+            final_urls.append(up["url"])
+            up_json = dispatch("upload_artifact", {"file_path": jp})
+            if "error" not in up_json:
+                json_urls.append(up_json["url"])
+
+        _clear_session(ctx, sender)
+        finals = "\n".join(f"- {u}" for u in final_urls)
+        jsons = "\n".join(f"- {u}" for u in json_urls) if json_urls else ""
+        plural = "s" if len(final_urls) > 1 else ""
+        msg = (
+            f"Payment of {sess['quoted_fet_str']} test FET confirmed on-chain "
+            f"(tx `{tx_hash}`).\n\nFinal reconstruction{plural}:\n{finals}"
+        )
+        if jsons:
+            msg += f"\n\nStructured JSON:\n{jsons}"
+        msg += "\n\nThanks!"
+        return msg
+
+    return "Send a floor-plan URL to get started."
+
+
+# ── uagent + chat protocol plumbing ──────────────────────────────────────────
+
+agent = Agent(
+    name="sensegrid",
+    seed=AGENT_SEED,
+    port=8001,
+    mailbox=True,
+    publish_agent_details=True,
+)
+
+protocol = Protocol(spec=chat_protocol_spec)
+
+
+def _reply(text: str) -> ChatMessage:
+    return ChatMessage(
+        timestamp=datetime.now(timezone.utc),
+        msg_id=uuid4(),
+        content=[
+            TextContent(type="text", text=text),
+            EndSessionContent(type="end-session"),
+        ],
+    )
+
+
+@protocol.on_message(ChatMessage)
+async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
+    await ctx.send(
+        sender,
+        ChatAcknowledgement(
+            timestamp=datetime.now(timezone.utc),
+            acknowledged_msg_id=msg.msg_id,
+        ),
+    )
+
+    user_text = "".join(
+        item.text for item in msg.content if isinstance(item, TextContent)
+    ).strip()
+    if not user_text:
+        await ctx.send(sender, _reply("I received an empty message. Please send a floor-plan image URL."))
+        return
+
+    ctx.logger.info("chat from %s: %r", sender[:12] + "…", user_text[:160])
+
+    try:
+        answer = handle_chat(ctx, sender, user_text)
+    except Exception as exc:
+        ctx.logger.exception("payment flow crashed")
+        answer = f"Something went wrong while processing your request: {exc}"
+
+    await ctx.send(sender, _reply(answer))
+
+
+@protocol.on_message(ChatAcknowledgement)
+async def on_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
+    ctx.logger.debug("ack from %s for %s", sender[:12] + "…", msg.acknowledged_msg_id)
+
+
+agent.include(protocol, publish_manifest=True)
+
+
+if __name__ == "__main__":
+    log.info("SenseGrid starting.")
+    log.info("Service wallet (receives payments): %s", agent.wallet.address())
+    log.info("Demo user-proxy wallet (auto-pays):  %s", user_wallet.address())
+    log.info("Fund the user-proxy once at: %s/%s", FAUCET_URL, user_wallet.address())
+    agent.run()

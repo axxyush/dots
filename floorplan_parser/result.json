@@ -1,0 +1,650 @@
+{
+  "floor_plan": {
+    "id": "floor_1",
+    "source_image": "restaurant_map.png",
+    "dimensions_px": {
+      "width": 650,
+      "height": 364
+    },
+    "coordinate_system": "normalized_0_to_100",
+    "parse_metadata": {
+      "tile_grid": "cv",
+      "overlap_pct": 0.0,
+      "tiles_parsed": 1,
+      "total_objects_before_dedup": 31,
+      "total_objects_after_dedup": 31
+    },
+    "rooms": [
+      {
+        "id": "room_0",
+        "type": "utility",
+        "label": "Utility",
+        "position": {
+          "x": 75.23,
+          "y": 19.78,
+          "w": 4.46,
+          "h": 11.81
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_1",
+        "type": "stairs",
+        "label": "Stairs",
+        "position": {
+          "x": 3.38,
+          "y": 47.8,
+          "w": 7.85,
+          "h": 11.26
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_2",
+        "type": "restroom",
+        "label": "Restroom",
+        "position": {
+          "x": 16.92,
+          "y": 12.91,
+          "w": 6.15,
+          "h": 12.09
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_3",
+        "type": "restroom",
+        "label": "Restroom",
+        "position": {
+          "x": 16.92,
+          "y": 76.65,
+          "w": 6.77,
+          "h": 8.52
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_4",
+        "type": "unknown",
+        "label": "Unknown",
+        "position": {
+          "x": 69.54,
+          "y": 73.08,
+          "w": 5.54,
+          "h": 9.34
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_5",
+        "type": "bedroom",
+        "label": "Bedroom",
+        "position": {
+          "x": 24.77,
+          "y": 18.96,
+          "w": 5.54,
+          "h": 9.62
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_6",
+        "type": "bathroom",
+        "label": "Bathroom",
+        "position": {
+          "x": 24.62,
+          "y": 69.51,
+          "w": 9.38,
+          "h": 20.6
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_7",
+        "type": "unknown",
+        "label": "Unknown",
+        "position": {
+          "x": 9.23,
+          "y": 65.38,
+          "w": 5.08,
+          "h": 10.16
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_8",
+        "type": "unknown",
+        "label": "Unknown",
+        "position": {
+          "x": 88.0,
+          "y": 73.08,
+          "w": 5.69,
+          "h": 9.34
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_9",
+        "type": "bedroom",
+        "label": "Bedroom",
+        "position": {
+          "x": 7.54,
+          "y": 19.23,
+          "w": 5.69,
+          "h": 9.34
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_10",
+        "type": "unknown",
+        "label": "Unknown",
+        "position": {
+          "x": 58.77,
+          "y": 19.23,
+          "w": 5.69,
+          "h": 9.34
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_11",
+        "type": "utility",
+        "label": "Utility",
+        "position": {
+          "x": 52.15,
+          "y": 73.08,
+          "w": 5.69,
+          "h": 9.34
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_12",
+        "type": "unknown",
+        "label": "Unknown",
+        "position": {
+          "x": 41.85,
+          "y": 18.96,
+          "w": 5.69,
+          "h": 9.62
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_13",
+        "type": "unknown",
+        "label": "Unknown",
+        "position": {
+          "x": 34.15,
+          "y": 73.08,
+          "w": 5.69,
+          "h": 9.34
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_14",
+        "type": "restroom",
+        "label": "Restroom",
+        "position": {
+          "x": 51.85,
+          "y": 13.46,
+          "w": 5.23,
+          "h": 11.54
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_15",
+        "type": "bedroom",
+        "label": "Bedroom",
+        "position": {
+          "x": 3.38,
+          "y": 77.47,
+          "w": 8.77,
+          "h": 7.69
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_16",
+        "type": "restroom",
+        "label": "Restroom",
+        "position": {
+          "x": 41.85,
+          "y": 76.65,
+          "w": 5.69,
+          "h": 12.09
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_17",
+        "type": "bathroom",
+        "label": "Bathroom",
+        "position": {
+          "x": 77.08,
+          "y": 76.37,
+          "w": 5.54,
+          "h": 12.36
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_18",
+        "type": "restroom",
+        "label": "Restroom",
+        "position": {
+          "x": 59.69,
+          "y": 76.37,
+          "w": 5.69,
+          "h": 12.36
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_19",
+        "type": "bathroom",
+        "label": "Bathroom",
+        "position": {
+          "x": 31.08,
+          "y": 9.07,
+          "w": 9.23,
+          "h": 24.18
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_20",
+        "type": "restroom",
+        "label": "Restroom",
+        "position": {
+          "x": 68.46,
+          "y": 9.07,
+          "w": 5.85,
+          "h": 15.93
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_21",
+        "type": "bedroom",
+        "label": "Bedroom",
+        "position": {
+          "x": 48.46,
+          "y": 61.81,
+          "w": 10.31,
+          "h": 10.99
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_22",
+        "type": "bedroom",
+        "label": "Bedroom",
+        "position": {
+          "x": 83.54,
+          "y": 61.81,
+          "w": 11.08,
+          "h": 10.99
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_23",
+        "type": "bedroom",
+        "label": "Bedroom",
+        "position": {
+          "x": 3.38,
+          "y": 64.29,
+          "w": 20.31,
+          "h": 20.88
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_24",
+        "type": "bathroom",
+        "label": "Bathroom",
+        "position": {
+          "x": 6.77,
+          "y": 9.07,
+          "w": 16.31,
+          "h": 31.32
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_25",
+        "type": "bedroom",
+        "label": "Bedroom",
+        "position": {
+          "x": 41.38,
+          "y": 9.07,
+          "w": 15.69,
+          "h": 31.32
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_26",
+        "type": "bedroom",
+        "label": "Bedroom",
+        "position": {
+          "x": 58.0,
+          "y": 9.07,
+          "w": 16.31,
+          "h": 31.32
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_27",
+        "type": "bedroom",
+        "label": "Bedroom",
+        "position": {
+          "x": 59.69,
+          "y": 61.81,
+          "w": 16.31,
+          "h": 30.77
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_28",
+        "type": "bathroom",
+        "label": "Bathroom",
+        "position": {
+          "x": 76.92,
+          "y": 61.81,
+          "w": 17.69,
+          "h": 30.77
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_29",
+        "type": "bedroom",
+        "label": "Bedroom",
+        "position": {
+          "x": 41.85,
+          "y": 61.81,
+          "w": 16.92,
+          "h": 30.77
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      },
+      {
+        "id": "room_30",
+        "type": "stairs",
+        "label": "Stairs",
+        "position": {
+          "x": 6.77,
+          "y": 8.24,
+          "w": 87.85,
+          "h": 59.89
+        },
+        "partial": false,
+        "confidence": "high",
+        "door_type": null,
+        "door_swing": null,
+        "accessible": true,
+        "width_m": null,
+        "notes": null,
+        "seen_in_tiles": 1,
+        "source": "cv"
+      }
+    ],
+    "corridors": [],
+    "doors": [],
+    "verticals": [],
+    "emergency": [],
+    "labels": [],
+    "low_confidence_flags": [],
+    "navigation_graph": {
+      "nodes": [],
+      "edges": []
+    }
+  }
+}

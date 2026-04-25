@@ -1,0 +1,50 @@
+{
+  "source_image": "restaurant_map.png",
+  "dimensions_px": {
+    "width": 650,
+    "height": 364
+  },
+  "totals": {
+    "rooms": 31,
+    "doors": 0,
+    "verticals": 0,
+    "emergency": 0,
+    "labels": 0,
+    "corridors": 0
+  },
+  "counts_per_type": {
+    "bathroom": 5,
+    "bedroom": 10,
+    "restroom": 6,
+    "stairs": 2,
+    "unknown": 6,
+    "utility": 2
+  },
+  "canvas_coverage_pct": 100.0,
+  "room_overlaps_over_threshold": [
+    {
+      "a": "room_21",
+      "b": "room_29",
+      "iou": 0.218
+    },
+    {
+      "a": "room_22",
+      "b": "room_28",
+      "iou": 0.223
+    }
+  ],
+  "overlap_threshold": 0.2,
+  "out_of_bounds_ids": [],
+  "partial_objects": 0,
+  "low_confidence_count": 0,
+  "corridor_segments": 0,
+  "corridor_centerline_points_mean": 0.0,
+  "output_image": "data/reconstructed.png",
+  "input_image": null,
+  "mode": "render_only",
+  "image_size_px": [
+    1250,
+    694
+  ],
+  "warnings": []
+}
