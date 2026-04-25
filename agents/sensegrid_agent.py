@@ -370,7 +370,7 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
         plural = "s" if len(sess["urls"]) > 1 else ""
         user_addr = str(user_wallet.address())
         return (
-            f"Parsed {sum(room_summary.values())} rooms across {sess['n_plans']} plan{plural} "
+            f"Found {sum(room_summary.values())} rooms across {sess['n_plans']} plan{plural} "
             f"({rooms_str}).\n\n"
             f"{pdf_block}"
             f"{ada_fallback}"
@@ -479,17 +479,6 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
             f"Payment of {sess['quoted_fet_str']} test FET confirmed on-chain "
             f"(tx `{tx_hash}`)."
         )
-        if txts:
-            msg += f"\n\n**Screen-reader companion (plain text):**\n{txts}"
-        if stls:
-            sx, sy, sz = (stl_info or {}).get("size_mm", (180.0, 180.0, 8.0))
-            base_mm = (stl_info or {}).get("base_thickness_mm", 5.0)
-            feat_mm = (stl_info or {}).get("feature_height_mm", 3.0)
-            msg += (
-                f"\n\n**3D-printable STL** ({sx/10:.0f} cm × {sy/10:.0f} cm × "
-                f"{sz:.1f} mm — {base_mm:.0f} mm base + {feat_mm:.0f} mm raised "
-                f"features; FDM-ready, no supports needed):\n{stls}"
-            )
         if jsons:
             msg += f"\n\nStructured JSON:\n{jsons}"
         if tactile:
@@ -566,66 +555,8 @@ async def on_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
 agent.include(protocol, publish_manifest=True)
 
 
-def _log_parser_health() -> None:
-    """At startup, print which parser path will run and flag any gotchas.
-
-    Without this banner, `parse_floorplan_llm` errors silently get swallowed
-    by the agent's CV fallback, and the user has no idea their LLM path is
-    broken until all rooms come back as "Unknown".
-    """
-    import sys
-    from pathlib import Path as _Path
-
-    repo_root = _Path(__file__).resolve().parents[1]
-    parser_dir = repo_root / "floorplan_parser"
-    if str(parser_dir) not in sys.path:
-        sys.path.insert(0, str(parser_dir))
-
-    bar = "═" * 68
-    log.info(bar)
-    log.info(" SenseGrid parser self-check")
-    log.info(bar)
-
-    openai_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
-    gemini_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
-    log.info(" OPENAI_API_KEY ....... %s",
-             f"set (prefix {openai_key[:10]}…, len {len(openai_key)})"
-             if openai_key else "MISSING — LLM path disabled")
-    log.info(" GEMINI_API_KEY ....... %s",
-             f"set (len {len(gemini_key)})" if gemini_key else "not set")
-    log.info(" OPENAI_PARSE_MODEL ... %s", os.environ.get("OPENAI_PARSE_MODEL", "gpt-5.4 (default)"))
-
-    try:
-        import openai  # noqa: F401
-        log.info(" openai package ....... ok (v%s)", openai.__version__)
-    except Exception as exc:
-        log.error(" openai package ....... MISSING (%s) — run: pip install -r requirements.txt", exc)
-
-    try:
-        import dotenv  # noqa: F401
-        log.info(" python-dotenv ........ ok")
-    except Exception:
-        log.error(" python-dotenv ........ MISSING — .env will NOT load. "
-                  "Run: pip install python-dotenv")
-
-    try:
-        from llm_floorplan import parse_floorplan_with_llm  # noqa: F401
-        log.info(" parse_floorplan_llm .. importable")
-    except Exception as exc:
-        log.error(" parse_floorplan_llm .. IMPORT FAILED (%s)", exc)
-
-    if openai_key:
-        log.info(" → Primary parser:  OpenAI end-to-end (parse_floorplan_llm)")
-    elif gemini_key:
-        log.info(" → Primary parser:  CV + Gemini labeling (fallback path)")
-    else:
-        log.warning(" → Primary parser:  CV only — all rooms will be labeled 'Unknown'!")
-    log.info(bar)
-
-
 if __name__ == "__main__":
     log.info("SenseGrid starting.")
-    _log_parser_health()
     log.info("Service wallet (receives payments): %s", agent.wallet.address())
     log.info("Demo user-proxy wallet (auto-pays):  %s", user_wallet.address())
     log.info("Fund the user-proxy once at: %s/%s", FAUCET_URL, user_wallet.address())

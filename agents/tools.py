@@ -39,7 +39,6 @@ extract_rooms_cv_multiscale = None  # type: ignore
 regions_to_floor_objects = None  # type: ignore
 from ada_advisor import generate_ada_recommendations  # noqa: E402
 from render_map import render_floor_plan  # noqa: E402
-from braille_map import generate_braille_map  # noqa: E402
 
 try:
     from cv_gemini_refine import label_regions_global as _gemini_label_global  # noqa: E402
@@ -264,7 +263,7 @@ def parse_floorplan(image_path: str) -> dict:
         labeling_error = "no regions to label"
     elif openai_key and _OPENAI_IMPORT_OK:
         labeling_provider = "openai"
-        labeling_model = os.environ.get("OPENAI_LABEL_MODEL", "gpt-5.4")
+        labeling_model = os.environ.get("OPENAI_LABEL_MODEL", "gpt-4o")
         try:
             log.info("parse_floorplan: calling OpenAI global labeling via %s…", labeling_model)
             regions = _openai_label_global(
@@ -512,7 +511,7 @@ def parse_floorplan_llm(image_path: str) -> dict:
     base.update(
         {
             "labeling_provider": "openai_end_to_end",
-            "labeling_model": os.environ.get("OPENAI_PARSE_MODEL", "gpt-5.4"),
+            "labeling_model": os.environ.get("OPENAI_PARSE_MODEL", "gpt-4o"),
             "labeling_status": "ok" if objs else "returned_no_rooms",
             "labeling_rooms_labeled": sum(
                 1 for o in objs if o.get("type") and o["type"] != "unknown"
@@ -564,148 +563,6 @@ def reconstruct_floorplan(json_path: str, blurred: bool = False) -> dict:
         "height": img.height,
         "blurred": blurred,
     }
-
-
-# ── Tool 4: braille_map_from_json ─────────────────────────────────────────────
-
-
-def braille_map_from_json(json_path: str, cols: int = 90) -> dict:
-    """Generate a tactile map PDF (ConnectDots pipeline) from result.json."""
-    p = Path(json_path)
-    if not p.exists():
-        return {"error": f"json not found: {json_path}"}
-
-    stem = p.stem.replace("_result", "")
-    out_pdf = ARTIFACT_DIR / f"{stem}_tactile_map.pdf"
-
-    res = generate_braille_map(
-        p,
-        out_pdf=out_pdf,
-        meters_width=12.0,
-    )
-    log.info("tactile pdf %s → %s", json_path, out_pdf)
-    return res
-
-
-# ── Tool 3b: generate_braille_map ────────────────────────────────────────────
-
-
-def generate_braille_map(json_path: str, blurred: bool = False) -> dict:
-    """Render the parsed JSON as a *tactile Braille map* for a blind user.
-
-    Produces two files:
-      * ``<stem>_tactile.png`` — high-contrast map with distinct hatched
-        textures per room category, real Braille dots for every room
-        label, a Braille-labelled legend panel, compass rose + scale bar.
-        Designed to be printed on swell paper or sent to a tactile
-        embosser.
-      * ``<stem>_tactile.txt`` — plain-text screen-reader companion that
-        walks through the building by compass zone.
-
-    When ``blurred=True`` the PNG is returned with a heavy Gaussian blur
-    so it can be shared as a teaser preview before payment is settled;
-    the text companion is omitted in that case.
-    """
-    p = Path(json_path)
-    if not p.exists():
-        return {"error": f"json not found: {json_path}"}
-    if not _BRAILLE_IMPORT_OK or render_tactile_map is None:
-        return {"error": "braille_map module unavailable (see server logs)"}
-
-    data = json.loads(p.read_text(encoding="utf-8"))
-    fp = data.get("floor_plan") or data
-
-    stem = p.stem.replace("_result", "")
-    suffix_png = "_tactile_preview.png" if blurred else "_tactile.png"
-    png_path = ARTIFACT_DIR / f"{stem}{suffix_png}"
-    txt_path = ARTIFACT_DIR / f"{stem}_tactile.txt"
-
-    title = fp.get("source_image") or stem
-    try:
-        render_tactile_map(
-            floor_plan=fp,
-            output_png=png_path,
-            output_txt=txt_path,
-            title=title,
-        )
-    except Exception as exc:
-        log.exception("tactile map render failed")
-        return {"error": f"tactile map render failed: {exc}"}
-
-    if blurred:
-        try:
-            from PIL import Image, ImageFilter  # noqa: WPS433
-            img = Image.open(png_path)
-            # Scale blur radius with image width so the paywall preview
-            # stays obviously blurred at any display resolution.
-            radius = max(30, img.width // 40)
-            img = img.filter(ImageFilter.GaussianBlur(radius=radius))
-            img.save(png_path, format="PNG")
-        except Exception as exc:
-            log.warning("tactile preview blur failed: %s", exc)
-
-    log.info("tactile map: %s → %s / %s (blurred=%s)",
-             json_path, png_path, txt_path, blurred)
-    return {
-        "png_path": str(png_path),
-        "txt_path": str(txt_path) if not blurred else None,
-        "rooms_rendered": len(fp.get("rooms", []) or []),
-        "blurred": blurred,
-    }
-
-
-# ── Tool 3c: generate_braille_stl ────────────────────────────────────────────
-
-
-def generate_braille_stl(
-    json_path: str,
-    base_size_cm: float = 18.0,
-    base_thickness_mm: float = 5.0,
-    feature_height_mm: float = 3.0,
-) -> dict:
-    """Generate a 3D-printable STL of the tactile Braille map.
-
-    Output is a square slab (default ``18 cm × 18 cm × 8 mm``) made of:
-      * a flat **base plate** (``base_thickness_mm``, default 5 mm) and
-      * **raised features** (``feature_height_mm``, default 3 mm) for the
-        outer building outline, each room outline, room category
-        patterns, plain-text labels, real Braille dots, pictogram icons,
-        compass rose, scale bar, and the legend panel.
-
-    Print directly on FDM (0.4 mm nozzle, 0.2 mm layers, no supports) or
-    SLA. The defaults match common ADA tactile-sign dimensions.
-    """
-    p = Path(json_path)
-    if not p.exists():
-        return {"error": f"json not found: {json_path}"}
-    if not _STL_IMPORT_OK or floor_plan_to_stl is None:
-        return {"error": "stl_export module unavailable (see server logs)"}
-
-    data = json.loads(p.read_text(encoding="utf-8"))
-    fp = data.get("floor_plan") or data
-    stem = p.stem.replace("_result", "")
-    stl_path = ARTIFACT_DIR / f"{stem}_tactile.stl"
-    title = fp.get("source_image") or stem
-
-    try:
-        info = floor_plan_to_stl(
-            fp,
-            stl_path,
-            base_size_mm=float(base_size_cm) * 10.0,
-            base_thickness_mm=float(base_thickness_mm),
-            feature_height_mm=float(feature_height_mm),
-            title=title,
-        )
-    except Exception as exc:
-        log.exception("stl export failed")
-        return {"error": f"stl export failed: {exc}"}
-
-    log.info(
-        "tactile STL: %s → %s (%d triangles, %.1f KB)",
-        json_path, stl_path, info["triangle_count"],
-        info["file_size_bytes"] / 1024.0,
-    )
-    return info
 
 
 # ── Tool 4: upload_artifact ──────────────────────────────────────────────────
@@ -832,25 +689,6 @@ TOOL_SPECS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "braille_map_from_json",
-            "description": (
-                "Generate a tactile Braille map from a parsed floor-plan JSON. "
-                "Returns paths to a Braille-unicode text map, a legend text file, "
-                "and a dot-rendered PNG preview."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "json_path": {"type": "string", "description": "Absolute path to a result.json produced by parse_floorplan."},
-                    "cols": {"type": "integer", "description": "Braille grid columns (higher = more detail).", "default": 90},
-                },
-                "required": ["json_path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "tactile_map_from_image_nanobanana",
             "description": (
                 "Generate a tactile-map PNG directly from an input floorplan image "
@@ -892,7 +730,6 @@ _DISPATCH = {
     "parse_floorplan": parse_floorplan,
     "parse_floorplan_llm": parse_floorplan_llm,
     "reconstruct_floorplan": reconstruct_floorplan,
-    "braille_map_from_json": braille_map_from_json,
     "tactile_map_from_image_nanobanana": tactile_map_from_image_nanobanana,
     "upload_artifact": upload_artifact,
 }
