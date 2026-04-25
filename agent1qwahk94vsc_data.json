@@ -1,3 +1,4 @@
 {
-    "sess:agent1qwtykrh6m9gk7z88c7dqyslrwvkuk4yxczqe6mvkwgd56ztafn4d5p7gq74": "{\"state\": \"quoted\", \"urls\": [\"https://raw.githubusercontent.com/octomaanav/braille-map-test/refs/heads/main/mall-floor-plan.png?token=GHSAT0AAAAAADW3M5GK6CG6PUEE2XX3B5D22PMI4AA\"], \"quoted_atestfet\": 500000000000613112, \"quoted_fet_str\": \"0.5\", \"n_plans\": 1, \"expires_at\": 1777091586.8617952}"
+    "sess:agent1qwtykrh6m9gk7z88c7dqyslrwvkuk4yxczqe6mvkwgd56ztafn4d5p7gq74": "{\"state\": \"quoted\", \"urls\": [\"https://raw.githubusercontent.com/octomaanav/braille-map-test/refs/heads/main/mall-floor-plan.png?token=GHSAT0AAAAAADW3M5GK6CG6PUEE2XX3B5D22PMI4AA\"], \"quoted_atestfet\": 500000000000613112, \"quoted_fet_str\": \"0.5\", \"n_plans\": 1, \"expires_at\": 1777091586.8617952}",
+    "sess:agent1q2gxx6fdcyfen0v9rcugrxxzvh4xc6lrrssx2lfrnya06stgymvl7dkxen0": "{\"state\": \"idle\"}"
 }

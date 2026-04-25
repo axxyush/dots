@@ -12,7 +12,8 @@ Flow (deterministic state machine; payment is NOT trusted to an LLM):
 Run:
     pip install -r requirements.txt
     # In .env at repo root:
-    #   GEMINI_API_KEY=...
+    #   OPENAI_API_KEY=sk-...                # preferred — GPT-4o end-to-end parse
+    #   GEMINI_API_KEY=...                   # optional fallback labeler
     #   SENSEGRID_AGENT_SEED=<any long random phrase, keep stable>
     #   SENSEGRID_PRICE_PER_PLAN_FET=0.5     # optional, default 0.5
     #   SENSEGRID_PAYMENT_TIMEOUT_S=600      # optional, default 600
@@ -187,40 +188,96 @@ def _clear_session(ctx, sender: str) -> None:
     ctx.storage.set(_session_key(sender), json.dumps({"state": STATE_IDLE}))
 
 
-def _process_plans(urls: list[str], blurred: bool, logger: logging.Logger) -> tuple[list[str], list[str], dict[str, int], str | None]:
+def _process_plans(
+    urls: list[str],
+    blurred: bool,
+    logger: logging.Logger,
+) -> tuple[list[str], list[str], dict[str, int], list[dict], dict[str, int], str, list[str], str | None]:
     """Run download → parse → reconstruct(blurred) → upload for each URL.
-    Returns (json_paths, png_urls, room_summary, error_or_None)."""
+    Returns (json_paths, png_urls, room_summary, ada_findings, ada_summary, ada_report_text, ada_pdf_urls, error_or_None)."""
     json_paths: list[str] = []
     png_urls: list[str] = []
     room_summary: dict[str, int] = {}
+    ada_findings: list[dict] = []
+    ada_report_text: str = ""
+    ada_pdf_urls: list[str] = []
+    ada_summary: dict[str, int] = {
+        "total_findings": 0,
+        "high_severity": 0,
+        "medium_severity": 0,
+        "low_severity": 0,
+    }
 
     for url in urls:
         logger.info("processing %s", url)
         dl = dispatch("download_image", {"url": url})
         if "error" in dl:
-            return [], [], {}, f"Couldn't download {url}: {dl['error']}"
+            return [], [], {}, [], {}, "", [], f"Couldn't download {url}: {dl['error']}"
 
         parsed = dispatch("parse_floorplan_llm", {"image_path": dl["image_path"]})
         if "error" in parsed:
             logger.warning("LLM extractor failed (%s) — falling back to CV", parsed["error"])
             parsed = dispatch("parse_floorplan", {"image_path": dl["image_path"]})
         if "error" in parsed:
-            return [], [], {}, f"Couldn't parse {url}: {parsed['error']}"
+            return [], [], {}, [], {}, "", [], f"Couldn't parse {url}: {parsed['error']}"
 
         json_paths.append(parsed["json_path"])
         for k, v in parsed.get("rooms_by_type", {}).items():
             room_summary[k] = room_summary.get(k, 0) + v
+        for k in ("total_findings", "high_severity", "medium_severity", "low_severity"):
+            ada_summary[k] = ada_summary.get(k, 0) + int((parsed.get("ada_summary") or {}).get(k, 0))
+        for rec in parsed.get("ada_findings", []):
+            if isinstance(rec, dict):
+                ada_findings.append(rec)
+        if not ada_report_text and isinstance(parsed.get("ada_report_text"), str):
+            ada_report_text = parsed["ada_report_text"]
+        pdf_path = parsed.get("ada_report_pdf_path")
+        if isinstance(pdf_path, str) and pdf_path.strip():
+            up_pdf = dispatch("upload_artifact", {"file_path": pdf_path})
+            if "error" not in up_pdf and up_pdf.get("url"):
+                ada_pdf_urls.append(up_pdf["url"])
 
         rec = dispatch("reconstruct_floorplan", {"json_path": parsed["json_path"], "blurred": blurred})
         if "error" in rec:
-            return [], [], {}, f"Render failed: {rec['error']}"
+            return [], [], {}, [], {}, "", [], f"Render failed: {rec['error']}"
 
         up = dispatch("upload_artifact", {"file_path": rec["png_path"]})
         if "error" in up:
-            return [], [], {}, f"Upload failed: {up['error']}"
+            return [], [], {}, [], {}, "", [], f"Upload failed: {up['error']}"
         png_urls.append(up["url"])
 
-    return json_paths, png_urls, room_summary, None
+    # De-duplicate similar findings across multi-plan batches.
+    seen = set()
+    uniq_findings: list[dict] = []
+    for finding in ada_findings:
+        key = (finding.get("category"), finding.get("ada_reference"), finding.get("observed_condition"))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq_findings.append(finding)
+
+    return json_paths, png_urls, room_summary, uniq_findings, ada_summary, ada_report_text, ada_pdf_urls, None
+
+
+def _format_ada_report_block(
+    ada_summary: dict[str, int],
+    ada_findings: list[dict],
+    ada_report_text: str,
+) -> str:
+    if ada_report_text:
+        return f"**Preliminary ADA Compliance Report**\n\n{ada_report_text}"
+    if not ada_findings:
+        return (
+            "**Preliminary ADA Compliance Report**\n\n"
+            "No reportable findings were generated from current parsed data."
+        )
+    return (
+        "**Preliminary ADA Compliance Report**\n\n"
+        f"Findings: {ada_summary.get('total_findings', 0)} "
+        f"(High {ada_summary.get('high_severity', 0)}, "
+        f"Medium {ada_summary.get('medium_severity', 0)}, "
+        f"Low {ada_summary.get('low_severity', 0)})."
+    )
 
 
 def handle_chat(ctx, sender: str, user_text: str) -> str:
@@ -276,7 +333,7 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
                 f"{sess['quoted_fet_str']} test FET, or 'no' to cancel."
             )
 
-        json_paths, blurred_urls, room_summary, err = _process_plans(
+        json_paths, blurred_urls, room_summary, ada_findings, ada_summary, ada_report_text, ada_pdf_urls, err = _process_plans(
             sess["urls"], blurred=True, logger=logger
         )
         if err:
@@ -297,6 +354,10 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
                 "json_paths": json_paths,
                 "blurred_urls": blurred_urls,
                 "room_summary": room_summary,
+                "ada_findings": ada_findings,
+                "ada_summary": ada_summary,
+                "ada_report_text": ada_report_text,
+                "ada_pdf_urls": ada_pdf_urls,
                 "start_balance_atestfet": start_balance,
                 "pay_address": pay_addr,
                 "expires_at": time.time() + PAYMENT_TIMEOUT_S,
@@ -306,12 +367,22 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
 
         rooms_str = ", ".join(f"{k}: {v}" for k, v in sorted(room_summary.items()))
         previews = "\n".join(f"- {u}" for u in blurred_urls)
+        pdfs = "\n".join(f"- {u}" for u in sess.get("ada_pdf_urls", []))
+        pdf_block = f"**ADA report (PDF):**\n{pdfs}\n\n" if pdfs else ""
+        ada_text = _format_ada_report_block(
+            ada_summary=sess.get("ada_summary", {}),
+            ada_findings=sess.get("ada_findings", []),
+            ada_report_text=sess.get("ada_report_text", ""),
+        )
+        ada_fallback = f"{ada_text}\n\n" if not pdfs else ""
         plural = "s" if len(sess["urls"]) > 1 else ""
         user_addr = str(user_wallet.address())
         return (
             f"Found {sum(room_summary.values())} rooms across {sess['n_plans']} plan{plural} "
             f"({rooms_str}).\n\n"
             f"**Blurred preview:**\n{previews}\n\n"
+            f"{pdf_block}"
+            f"{ada_fallback}"
             f"Reply **'yes'** to authorize payment of **{sess['quoted_fet_str']} test FET** "
             f"— I'll execute the transfer on-chain (Dorado) automatically and deliver the "
             f"full reconstruction. Reply 'no' to cancel.\n\n"
@@ -396,6 +467,14 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
         )
         if jsons:
             msg += f"\n\nStructured JSON:\n{jsons}"
+        if sess.get("ada_pdf_urls"):
+            msg += "\n\nADA report (PDF):\n" + "\n".join(f"- {u}" for u in sess["ada_pdf_urls"])
+        else:
+            msg += "\n\n" + _format_ada_report_block(
+                ada_summary=sess.get("ada_summary", {}),
+                ada_findings=sess.get("ada_findings", []),
+                ada_report_text=sess.get("ada_report_text", ""),
+            )
         msg += "\n\nThanks!"
         return msg
 
