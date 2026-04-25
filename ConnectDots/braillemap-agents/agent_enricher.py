@@ -384,18 +384,46 @@ async def on_enrichment_request(
             f"objects relabeled"
         )
 
-    # Fan out to map generator, narration agent, and ADA recommendations agent.
-    ctx.logger.info(f"→ MapGenerationRequest  → {MAP_AGENT_ADDRESS}")
+    # Use remote agent for Map and ADA Report
+    # We try to use cloudinary_floorplan_url first, or fallback to the first photo
+    image_url = room.get("cloudinary_floorplan_url")
+    if not image_url and room.get("cloudinary_photo_urls"):
+        image_url = room.get("cloudinary_photo_urls")[0]
+        
+    if image_url:
+        ctx.logger.info(f"Calling remote tactile API with {image_url}")
+        try:
+            res = requests.post(
+                "http://66.42.127.155:8000/tactile/from-url",
+                json={"image_url": image_url, "model": "gemini-3-pro-image-preview"},
+                timeout=60
+            )
+            if res.status_code == 200:
+                tactile_data = res.json()
+                pdf_url = tactile_data.get("tactile_png_url")
+                ada_url = tactile_data.get("ada_report_url", None)
+                
+                updates = {
+                    "pdf_url": pdf_url,
+                    "status_map_done": True,
+                }
+                if ada_url:
+                    updates["recommendations_pdf_url"] = ada_url
+                    updates["status_recommendations_done"] = True
+                else:
+                    updates["status_recommendations_done"] = True
+                    
+                patch_room(room_id, updates)
+                ctx.logger.info(f"Remote tactile generation successful: {pdf_url}")
+            else:
+                ctx.logger.error(f"Remote tactile API failed: {res.status_code} {res.text}")
+        except Exception as e:
+            ctx.logger.error(f"Error calling remote tactile API: {e}")
+    else:
+        ctx.logger.warning("No cloudinary URLs found, skipping remote tactile map.")
+
     ctx.logger.info(f"→ NarrationRequest      → {NARRATION_AGENT_ADDRESS}")
-    await ctx.send(MAP_AGENT_ADDRESS, MapGenerationRequest(room_id=room_id))
     await ctx.send(NARRATION_AGENT_ADDRESS, NarrationRequest(room_id=room_id))
-    if RECOMMENDATIONS_AGENT_ADDRESS:
-        ctx.logger.info(
-            f"→ RecommendationsRequest → {RECOMMENDATIONS_AGENT_ADDRESS}"
-        )
-        await ctx.send(
-            RECOMMENDATIONS_AGENT_ADDRESS, RecommendationsRequest(room_id=room_id)
-        )
 
 
 if __name__ == "__main__":

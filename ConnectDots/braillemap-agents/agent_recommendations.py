@@ -59,6 +59,22 @@ if not AGENT_SEED_6:
 if not GEMINI_API_KEY and not ASI_API_KEY:
     raise SystemExit("Set at least one of GEMINI_API_KEY or ASI_API_KEY in .env")
 
+USE_CLOUDINARY = os.getenv("Set_cloudinary", "false").lower() == "true"
+if USE_CLOUDINARY:
+    import cloudinary
+    import cloudinary.uploader
+    CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
+    CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
+    CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
+    if not (CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET):
+        raise SystemExit("Set CLOUDINARY_* vars in .env or set Set_cloudinary=false")
+    cloudinary.config(
+        cloud_name=CLOUDINARY_CLOUD_NAME,
+        api_key=CLOUDINARY_API_KEY,
+        api_secret=CLOUDINARY_API_SECRET,
+        secure=True,
+    )
+
 # Lazy-init so we don't pay the import cost when only ASI is available.
 _gemini_client = None
 
@@ -477,7 +493,18 @@ def patch_room(room_id: str, updates: Dict[str, Any]) -> None:
     resp.raise_for_status()
 
 
-def served_url(path: str) -> str:
+def served_url(path: str, room_id: str) -> str:
+    if USE_CLOUDINARY:
+        result = cloudinary.uploader.upload(
+            path,
+            resource_type="raw",
+            folder="braillemap/recommendations",
+            public_id=f"recommendations_{room_id}",
+            overwrite=True,
+            use_filename=False,
+            unique_filename=False,
+        )
+        return result["secure_url"]
     return f"{BACKEND_URL}/files/recommendations/{os.path.basename(path)}"
 
 
@@ -535,7 +562,15 @@ async def on_recommendations_request(
         )
         return
 
-    url = served_url(path)
+    try:
+        url = served_url(path, room_id)
+    except Exception as exc:
+        ctx.logger.error(f"recommendations storage failed: {exc}")
+        patch_room(
+            room_id,
+            {"status": "error_recommendations_storage", "recommendations_error": str(exc)},
+        )
+        return
     patch_room(
         room_id,
         {

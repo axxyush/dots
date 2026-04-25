@@ -25,7 +25,7 @@ load_dotenv()
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
 AGENT_SEED_4 = os.getenv("AGENT_SEED_4")
 AGENT_PORT_4 = int(os.getenv("AGENT_PORT_4", "8004"))
-USE_CLOUDINARY = os.getenv("USE_CLOUDINARY", "false").lower() == "true"
+USE_CLOUDINARY = os.getenv("Set_cloudinary", "false").lower() == "true"
 
 ASI_API_URL = os.getenv("ASI_API_URL", "https://api.asi1.ai/v1/chat/completions")
 ASI_API_KEY = os.getenv("ASI_API_KEY")
@@ -56,7 +56,7 @@ if USE_CLOUDINARY:
     CLOUDINARY_API_KEY_C = os.getenv("CLOUDINARY_API_KEY")
     CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
     if not (CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY_C and CLOUDINARY_API_SECRET):
-        raise SystemExit("Set CLOUDINARY_* vars in .env or set USE_CLOUDINARY=false")
+        raise SystemExit("Set CLOUDINARY_* vars in .env or set Set_cloudinary=false")
     cloudinary.config(
         cloud_name=CLOUDINARY_CLOUD_NAME,
         api_key=CLOUDINARY_API_KEY_C,

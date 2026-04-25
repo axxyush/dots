@@ -335,24 +335,73 @@ async def process_floorplan(ctx: Context, room_id: str) -> Optional[str]:
         "status": "floorplan_analyzed",
     })
 
-    # Trigger Agents 3 (Map) and 4 (Narration) directly
-    ctx.logger.info(f"→ sending MapGenerationRequest to {MAP_ADDRESS}")
-    await ctx.send(MAP_ADDRESS, MapGenerationRequest(room_id=room_id))
+    # Call the remote agent for the tactile map and ADA report
+    image_url = room_data.get("cloudinary_floorplan_url")
 
+    # Fallback: if Cloudinary URL is not available, upload the base64 image ourselves
+    if not image_url and image_base64:
+        ctx.logger.info("cloudinary_floorplan_url not found, uploading base64 image to Cloudinary...")
+        try:
+            import cloudinary
+            import cloudinary.uploader
+            cloudinary.config(
+                cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+                api_key=os.getenv("CLOUDINARY_API_KEY"),
+                api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+                secure=True,
+            )
+            img_data = image_base64
+            if not img_data.startswith("data:"):
+                img_data = f"data:image/jpeg;base64,{img_data}"
+            res = cloudinary.uploader.upload(
+                img_data,
+                folder="braillemap/floorplans",
+                public_id=f"floorplan_{room_id}",
+            )
+            image_url = res.get("secure_url")
+            if image_url:
+                patch_room(room_id, {"cloudinary_floorplan_url": image_url})
+                ctx.logger.info(f"Uploaded to Cloudinary: {image_url}")
+        except Exception as e:
+            ctx.logger.error(f"Cloudinary fallback upload failed: {e}")
+
+    if image_url:
+        ctx.logger.info(f"Calling remote tactile API with {image_url}")
+        try:
+            res = requests.post(
+                "http://66.42.127.155:8000/tactile/from-url",
+                json={"image_url": image_url, "model": "gemini-3-pro-image-preview"},
+                timeout=120
+            )
+            if res.status_code == 200:
+                tactile_data = res.json()
+                pdf_url = tactile_data.get("tactile_png_url")
+                # Attempt to get an ADA report url if it exists in the payload, otherwise fallback
+                ada_url = tactile_data.get("ada_report_url", None)
+                
+                updates = {
+                    "pdf_url": pdf_url,
+                    "status_map_done": True,
+                }
+                if ada_url:
+                    updates["recommendations_pdf_url"] = ada_url
+                    updates["status_recommendations_done"] = True
+                else:
+                    # If the remote API doesn't return ADA report, mark it done to prevent iOS app from hanging
+                    updates["status_recommendations_done"] = True
+                    
+                patch_room(room_id, updates)
+                ctx.logger.info(f"Remote tactile generation successful: {pdf_url}")
+            else:
+                ctx.logger.error(f"Remote tactile API failed: {res.status_code} {res.text}")
+        except Exception as e:
+            ctx.logger.error(f"Error calling remote tactile API: {e}")
+    else:
+        ctx.logger.warning("No image URL available for remote tactile map generation.")
+
+    # Trigger Agent 4 (Narration) directly for ElevenLabs pipeline
     ctx.logger.info(f"→ sending NarrationRequest to {NARRATION_ADDRESS}")
     await ctx.send(NARRATION_ADDRESS, NarrationRequest(room_id=room_id))
-
-    if RECOMMENDATIONS_ADDRESS:
-        ctx.logger.info(
-            f"→ sending RecommendationsRequest to {RECOMMENDATIONS_ADDRESS}"
-        )
-        await ctx.send(
-            RECOMMENDATIONS_ADDRESS, RecommendationsRequest(room_id=room_id)
-        )
-    else:
-        ctx.logger.info(
-            "AGENT_SEED_6 not set — skipping ADA recommendations agent"
-        )
 
     return None
 

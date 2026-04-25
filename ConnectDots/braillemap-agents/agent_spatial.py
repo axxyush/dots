@@ -14,7 +14,7 @@ import math
 import os
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 import requests
@@ -64,6 +64,72 @@ def _shift(px: float, pz: float, min_x: float, min_z: float) -> Tuple[float, flo
     return px - min_x, pz - min_z
 
 
+def _synthesize_walls_from_objects(
+    objects: List[Dict[str, Any]],
+    meta: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Build a 4-wall bounding rectangle around the detected objects.
+
+    RoomPlan sometimes ends a session without walls (poor lighting, partial
+    scan, user stopped early). When that happens we still have object data,
+    so we synthesize a rectangular room around the object bbox so the
+    downstream pipeline (enricher → map → narration → recommendations) can
+    still produce a usable Braille map and ADA report.
+    """
+    if not objects:
+        return []
+
+    xs = [float(o["positionX"]) for o in objects]
+    zs = [float(o["positionZ"]) for o in objects]
+    obj_w = [float(o.get("widthMeters") or 0.0) for o in objects]
+    obj_d = [float(o.get("depthMeters") or o.get("widthMeters") or 0.0) for o in objects]
+
+    pad = 1.5  # m of padding so the room isn't tight against the objects
+    min_x = min(x - w / 2 for x, w in zip(xs, obj_w)) - pad
+    max_x = max(x + w / 2 for x, w in zip(xs, obj_w)) + pad
+    min_z = min(z - d / 2 for z, d in zip(zs, obj_d)) - pad
+    max_z = max(z + d / 2 for z, d in zip(zs, obj_d)) + pad
+
+    width = max(max_x - min_x, 2.0)
+    depth = max(max_z - min_z, 2.0)
+    cx = (min_x + max_x) / 2
+    cz = (min_z + max_z) / 2
+
+    height = float(meta.get("roomHeightMeters") or 2.5)
+
+    # Two pairs of walls forming a rectangle — yaw 0 = horizontal (width axis).
+    return [
+        {  # bottom
+            "index": 0,
+            "positionX": cx, "positionY": 0.0, "positionZ": min_z,
+            "widthMeters": width, "heightMeters": height,
+            "rotationQuaternion": {"x": 0, "y": 0, "z": 0, "w": 1},
+            "_synthesized": True,
+        },
+        {  # top
+            "index": 1,
+            "positionX": cx, "positionY": 0.0, "positionZ": max_z,
+            "widthMeters": width, "heightMeters": height,
+            "rotationQuaternion": {"x": 0, "y": 0, "z": 0, "w": 1},
+            "_synthesized": True,
+        },
+        {  # left — yaw 90° about Y (sin(45)=0.7071)
+            "index": 2,
+            "positionX": min_x, "positionY": 0.0, "positionZ": cz,
+            "widthMeters": depth, "heightMeters": height,
+            "rotationQuaternion": {"x": 0, "y": 0.7071068, "z": 0, "w": 0.7071068},
+            "_synthesized": True,
+        },
+        {  # right
+            "index": 3,
+            "positionX": max_x, "positionY": 0.0, "positionZ": cz,
+            "widthMeters": depth, "heightMeters": height,
+            "rotationQuaternion": {"x": 0, "y": 0.7071068, "z": 0, "w": 0.7071068},
+            "_synthesized": True,
+        },
+    ]
+
+
 def project_to_2d(scan_data: Dict[str, Any]) -> Dict[str, Any]:
     """Drop Y, normalize so the room's min corner is (0, 0), return a clean layout."""
     walls = scan_data.get("walls") or []
@@ -72,8 +138,14 @@ def project_to_2d(scan_data: Dict[str, Any]) -> Dict[str, Any]:
     objects = scan_data.get("objects") or []
     meta = scan_data.get("metadata") or {}
 
+    walls_synthesized = False
     if not walls:
-        return {"error": "no_walls_in_scan"}
+        if not objects:
+            return {"error": "no_walls_or_objects_in_scan"}
+        walls = _synthesize_walls_from_objects(objects, meta)
+        walls_synthesized = True
+        if not walls:
+            return {"error": "no_walls_or_objects_in_scan"}
 
     xs = [float(w["positionX"]) for w in walls]
     zs = [float(w["positionZ"]) for w in walls]
@@ -158,7 +230,7 @@ def project_to_2d(scan_data: Dict[str, Any]) -> Dict[str, Any]:
             "parent_wall_index": longest["index"],
         }
 
-    return {
+    layout = {
         "room_width": room_width,
         "room_depth": room_depth,
         "origin_offset": {"x": min_x, "z": min_z},
@@ -167,7 +239,15 @@ def project_to_2d(scan_data: Dict[str, Any]) -> Dict[str, Any]:
         "windows": windows_2d,
         "objects": objects_2d,
         "entrance": entrance,
+        "source": "scan",
     }
+    if walls_synthesized:
+        # Tells downstream agents (recommendations, narration) that the walls
+        # are an estimated bbox rather than a true RoomPlan capture.
+        layout["walls_synthesized"] = True
+        layout["space_name"] = (meta.get("roomName") or "Scanned space")
+        layout["space_type"] = "room"
+    return layout
 
 
 # ── Backend I/O ──────────────────────────────────────────────────────────────
@@ -196,20 +276,16 @@ async def process_room(ctx: Context, room_id: str) -> Optional[str]:
         return err
 
     scan_data = room.get("scan_data") or {}
-    if not scan_data.get("walls"):
-        err = f"room {room_id} has no walls in scan_data"
-        ctx.logger.error(err)
-        try:
-            patch_room(room_id, {"status": "error_no_walls"})
-        except Exception:
-            pass
-        return err
-
     layout = project_to_2d(scan_data)
     if "error" in layout:
         ctx.logger.error(f"projection failed: {layout['error']}")
         patch_room(room_id, {"status": f"error_{layout['error']}"})
         return layout["error"]
+    if layout.get("walls_synthesized"):
+        ctx.logger.warning(
+            f"RoomPlan returned no walls — synthesized a {layout['room_width']:.1f}m × "
+            f"{layout['room_depth']:.1f}m bbox from {len(layout.get('objects') or [])} objects"
+        )
 
     ctx.logger.info(
         f"room {room_id}: {layout['room_width']:.2f}m × {layout['room_depth']:.2f}m, "

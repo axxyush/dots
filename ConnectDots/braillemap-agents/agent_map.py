@@ -9,7 +9,7 @@ rendered with Apple Braille font, so the PDF can be printed on swell paper
 (microcapsule / thermoform) for actual tactile reading.
 
 NOTE: Cloudinary is disabled for local testing. Re-enable by setting
-USE_CLOUDINARY=true in .env and providing CLOUDINARY_* credentials.
+Set_cloudinary=true in .env and providing CLOUDINARY_* credentials.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ load_dotenv()
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
 AGENT_SEED_3 = os.getenv("AGENT_SEED_3")
 AGENT_PORT_3 = int(os.getenv("AGENT_PORT_3", "8003"))
-USE_CLOUDINARY = os.getenv("USE_CLOUDINARY", "false").lower() == "true"
+USE_CLOUDINARY = os.getenv("Set_cloudinary", "false").lower() == "true"
 
 # Local output directory — created next to this script
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs", "pdfs")
@@ -61,7 +61,7 @@ if USE_CLOUDINARY:
     CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
     CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
     if not (CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET):
-        raise SystemExit("Set CLOUDINARY_* vars in .env or set USE_CLOUDINARY=false")
+        raise SystemExit("Set CLOUDINARY_* vars in .env or set Set_cloudinary=false")
     cloudinary.config(
         cloud_name=CLOUDINARY_CLOUD_NAME,
         api_key=CLOUDINARY_API_KEY,
