@@ -48,6 +48,16 @@ except Exception as _braille_import_exc:  # pragma: no cover
     )
 
 try:
+    from stl_export import floor_plan_to_stl  # noqa: E402
+    _STL_IMPORT_OK = True
+except Exception as _stl_import_exc:  # pragma: no cover
+    floor_plan_to_stl = None  # type: ignore
+    _STL_IMPORT_OK = False
+    logging.getLogger("sensegrid.tools").warning(
+        "STL export module unavailable: %s", _stl_import_exc
+    )
+
+try:
     from cv_gemini_refine import label_regions_global as _gemini_label_global  # noqa: E402
     _GEMINI_IMPORT_OK = True
 except Exception as _gemini_import_exc:  # pragma: no cover
@@ -520,6 +530,60 @@ def generate_braille_map(json_path: str, blurred: bool = False) -> dict:
     }
 
 
+# ── Tool 3c: generate_braille_stl ────────────────────────────────────────────
+
+
+def generate_braille_stl(
+    json_path: str,
+    base_size_cm: float = 18.0,
+    base_thickness_mm: float = 5.0,
+    feature_height_mm: float = 3.0,
+) -> dict:
+    """Generate a 3D-printable STL of the tactile Braille map.
+
+    Output is a square slab (default ``18 cm × 18 cm × 8 mm``) made of:
+      * a flat **base plate** (``base_thickness_mm``, default 5 mm) and
+      * **raised features** (``feature_height_mm``, default 3 mm) for the
+        outer building outline, each room outline, room category
+        patterns, plain-text labels, real Braille dots, pictogram icons,
+        compass rose, scale bar, and the legend panel.
+
+    Print directly on FDM (0.4 mm nozzle, 0.2 mm layers, no supports) or
+    SLA. The defaults match common ADA tactile-sign dimensions.
+    """
+    p = Path(json_path)
+    if not p.exists():
+        return {"error": f"json not found: {json_path}"}
+    if not _STL_IMPORT_OK or floor_plan_to_stl is None:
+        return {"error": "stl_export module unavailable (see server logs)"}
+
+    data = json.loads(p.read_text(encoding="utf-8"))
+    fp = data.get("floor_plan") or data
+    stem = p.stem.replace("_result", "")
+    stl_path = ARTIFACT_DIR / f"{stem}_tactile.stl"
+    title = fp.get("source_image") or stem
+
+    try:
+        info = floor_plan_to_stl(
+            fp,
+            stl_path,
+            base_size_mm=float(base_size_cm) * 10.0,
+            base_thickness_mm=float(base_thickness_mm),
+            feature_height_mm=float(feature_height_mm),
+            title=title,
+        )
+    except Exception as exc:
+        log.exception("stl export failed")
+        return {"error": f"stl export failed: {exc}"}
+
+    log.info(
+        "tactile STL: %s → %s (%d triangles, %.1f KB)",
+        json_path, stl_path, info["triangle_count"],
+        info["file_size_bytes"] / 1024.0,
+    )
+    return info
+
+
 # ── Tool 4: upload_artifact ──────────────────────────────────────────────────
 
 
@@ -664,6 +728,30 @@ TOOL_SPECS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "generate_braille_stl",
+            "description": (
+                "Generate a 3D-printable STL of the tactile Braille map. "
+                "Default output is a square 18 cm × 18 cm slab with a 5 mm "
+                "base plate and 3 mm raised features (walls, room outlines, "
+                "patterns, plain-text labels, Braille dots, icons, compass, "
+                "legend) — i.e. 0.8 cm total height. Use this when the user "
+                "wants a downloadable STL file they can 3D-print."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "json_path": {"type": "string", "description": "Absolute path to a result.json produced by parse_floorplan."},
+                    "base_size_cm": {"type": "number", "description": "Side length of the square slab in centimetres (default 18)."},
+                    "base_thickness_mm": {"type": "number", "description": "Thickness of the base plate in mm (default 5)."},
+                    "feature_height_mm": {"type": "number", "description": "Height of raised features in mm (default 3)."},
+                },
+                "required": ["json_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "upload_artifact",
             "description": (
                 "Upload a local file (PNG/JSON) to a public no-auth host and return "
@@ -688,6 +776,7 @@ _DISPATCH = {
     "parse_floorplan_llm": parse_floorplan_llm,
     "reconstruct_floorplan": reconstruct_floorplan,
     "generate_braille_map": generate_braille_map,
+    "generate_braille_stl": generate_braille_stl,
     "upload_artifact": upload_artifact,
 }
 

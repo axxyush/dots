@@ -404,8 +404,9 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
             f"{ada_fallback}"
             f"Reply **'yes'** to authorize payment of **{sess['quoted_fet_str']} test FET** "
             f"— I'll execute the transfer on-chain (Dorado) automatically, then deliver the "
-            f"sharp tactile map (print-ready for swell paper / embosser) plus a plain-text "
-            f"screen-reader companion. Reply 'no' to cancel.\n\n"
+            f"sharp tactile map (print-ready for swell paper / embosser), a plain-text "
+            f"screen-reader companion, and a 3D-printable **STL** (18 cm × 18 cm × "
+            f"8 mm slab). Reply 'no' to cancel.\n\n"
             f"_Demo wallet: `{user_addr}` — top up at {FAUCET_URL}/{user_addr} if needed._"
         )
 
@@ -462,10 +463,12 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
                 f"Reply 'yes' in a few seconds to retry."
             )
 
-        # Render unblurred tactile map + text companion + upload + deliver.
+        # Render unblurred tactile map + text companion + STL + upload + deliver.
         final_urls: list[str] = []
         txt_urls: list[str] = []
         json_urls: list[str] = []
+        stl_urls: list[str] = []
+        stl_info: dict | None = None
         for jp in sess["json_paths"]:
             rec = dispatch("generate_braille_map", {"json_path": jp, "blurred": False})
             if "error" in rec:
@@ -482,10 +485,24 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
             if "error" not in up_json:
                 json_urls.append(up_json["url"])
 
+            # 3D-printable STL (18 cm × 18 cm × 8 mm by default)
+            stl_rec = dispatch("generate_braille_stl", {"json_path": jp})
+            if "error" in stl_rec:
+                logger.warning("STL export failed for %s: %s", jp, stl_rec["error"])
+            else:
+                stl_info = stl_rec
+                up_stl = dispatch("upload_artifact", {"file_path": stl_rec["stl_path"]})
+                if "error" not in up_stl:
+                    stl_urls.append(up_stl["url"])
+                else:
+                    logger.warning("STL upload failed for %s: %s",
+                                   stl_rec["stl_path"], up_stl["error"])
+
         _clear_session(ctx, sender)
         finals = "\n".join(f"- {u}" for u in final_urls)
         txts = "\n".join(f"- {u}" for u in txt_urls) if txt_urls else ""
         jsons = "\n".join(f"- {u}" for u in json_urls) if json_urls else ""
+        stls = "\n".join(f"- {u}" for u in stl_urls) if stl_urls else ""
         plural = "s" if len(final_urls) > 1 else ""
         msg = (
             f"Payment of {sess['quoted_fet_str']} test FET confirmed on-chain "
@@ -495,6 +512,15 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
         )
         if txts:
             msg += f"\n\n**Screen-reader companion (plain text):**\n{txts}"
+        if stls:
+            sx, sy, sz = (stl_info or {}).get("size_mm", (180.0, 180.0, 8.0))
+            base_mm = (stl_info or {}).get("base_thickness_mm", 5.0)
+            feat_mm = (stl_info or {}).get("feature_height_mm", 3.0)
+            msg += (
+                f"\n\n**3D-printable STL** ({sx/10:.0f} cm × {sy/10:.0f} cm × "
+                f"{sz:.1f} mm — {base_mm:.0f} mm base + {feat_mm:.0f} mm raised "
+                f"features; FDM-ready, no supports needed):\n{stls}"
+            )
         if jsons:
             msg += f"\n\n**Structured JSON:**\n{jsons}"
         if sess.get("ada_pdf_urls"):
