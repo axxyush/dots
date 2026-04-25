@@ -1,0 +1,141 @@
+{
+    "accuracyReport" : {
+      "detectedRoomSize" : "Detected room size: 0.00 m x 0.00 m",
+      "distanceReport" : [
+        "Distance from Chair #0 to Table #1: 0.90 m",
+        "Distance from Chair #0 to Table #2: 3.75 m",
+        "Distance from Chair #0 to Chair #3: 1.51 m",
+        "Distance from Table #1 to Table #2: 2.98 m",
+        "Distance from Table #1 to Chair #3: 0.90 m",
+        "Distance from Table #2 to Chair #3: 3.27 m"
+      ],
+      "doorCount" : 0,
+      "objectCount" : 4,
+      "objectInventory" : [
+        "Object: Chair at position (1.19, -0.46, 1.06), size: 0.59 x 0.62 x 0.89 m",
+        "Object: Table at position (0.86, -0.51, 0.22), size: 3.02 x 1.16 x 0.76 m",
+        "Object: Table at position (1.57, -0.51, -2.68), size: 1.81 x 1.03 x 0.75 m",
+        "Object: Chair at position (-0.04, -0.46, 0.18), size: 0.59 x 0.62 x 0.89 m"
+      ],
+      "scanDurationSeconds" : 66.20517492294312,
+      "wallCount" : 0,
+      "windowCount" : 0
+    },
+    "distanceMatrix" : [
+      {
+        "floorDistanceMeters" : 0.8981386036913658,
+        "objectA" : "Chair #0",
+        "objectAIndex" : 0,
+        "objectB" : "Table #1",
+        "objectBIndex" : 1
+      },
+      {
+        "floorDistanceMeters" : 3.75176120188318,
+        "objectA" : "Chair #0",
+        "objectAIndex" : 0,
+        "objectB" : "Table #2",
+        "objectBIndex" : 2
+      },
+      {
+        "floorDistanceMeters" : 1.5084052255159541,
+        "objectA" : "Chair #0",
+        "objectAIndex" : 0,
+        "objectB" : "Chair #3",
+        "objectBIndex" : 3
+      },
+      {
+        "floorDistanceMeters" : 2.982301478026558,
+        "objectA" : "Table #1",
+        "objectAIndex" : 1,
+        "objectB" : "Table #2",
+        "objectBIndex" : 2
+      },
+      {
+        "floorDistanceMeters" : 0.8981384002517573,
+        "objectA" : "Table #1",
+        "objectAIndex" : 1,
+        "objectB" : "Chair #3",
+        "objectBIndex" : 3
+      },
+      {
+        "floorDistanceMeters" : 3.274896719332683,
+        "objectA" : "Table #2",
+        "objectAIndex" : 2,
+        "objectB" : "Chair #3",
+        "objectBIndex" : 3
+      }
+    ],
+    "doors" : [
+  
+    ],
+    "metadata" : {
+      "boundingBox" : {
+        "maxX" : 0,
+        "maxY" : 0,
+        "maxZ" : 0,
+        "minX" : 0,
+        "minY" : 0,
+        "minZ" : 0
+      },
+      "roomDepthMeters" : 0,
+      "roomWidthMeters" : 0,
+      "scanDurationSeconds" : 66.20517492294312,
+      "timestamp" : "2026-04-25T21:06:19Z",
+      "totalDoors" : 0,
+      "totalObjects" : 4,
+      "totalWalls" : 0,
+      "totalWindows" : 0
+    },
+    "objects" : [
+      {
+        "category" : "Chair",
+        "confidence" : "Low",
+        "depthMeters" : 0.6172070503234863,
+        "heightMeters" : 0.8896054029464722,
+        "index" : 0,
+        "positionX" : 1.1864765882492065,
+        "positionY" : -0.45877426862716675,
+        "positionZ" : 1.0564391613006592,
+        "widthMeters" : 0.590412437915802
+      },
+      {
+        "category" : "Table",
+        "confidence" : "High",
+        "depthMeters" : 1.160521388053894,
+        "heightMeters" : 0.7575064301490784,
+        "index" : 1,
+        "positionX" : 0.8580480813980103,
+        "positionY" : -0.5086488723754883,
+        "positionZ" : 0.22050395607948303,
+        "widthMeters" : 3.016810417175293
+      },
+      {
+        "category" : "Table",
+        "confidence" : "Low",
+        "depthMeters" : 1.0288281440734863,
+        "heightMeters" : 0.7537976503372192,
+        "index" : 2,
+        "positionX" : 1.5693193674087524,
+        "positionY" : -0.5105032920837402,
+        "positionZ" : -2.6757376194000244,
+        "widthMeters" : 1.8056836128234863
+      },
+      {
+        "category" : "Chair",
+        "confidence" : "Low",
+        "depthMeters" : 0.6172070503234863,
+        "heightMeters" : 0.8896054029464722,
+        "index" : 3,
+        "positionX" : -0.03903632238507271,
+        "positionY" : -0.4587744176387787,
+        "positionZ" : 0.17700500786304474,
+        "widthMeters" : 0.5904124975204468
+      }
+    ],
+    "walls" : [
+  
+    ],
+    "windows" : [
+  
+    ]
+  }
