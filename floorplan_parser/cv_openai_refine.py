@@ -93,35 +93,62 @@ def _vision_generate(
     png_bytes: bytes,
     *,
     temperature: float = 0.0,
-    max_tokens: int = 4096,
+    max_completion_tokens: int = 4096,
     force_json_object: bool = True,
 ) -> str:
-    """Call the Chat Completions API with an inline image attachment."""
-    kwargs: dict[str, Any] = {
+    """Call the Chat Completions API with an inline image attachment.
+
+    Uses `max_completion_tokens` (new param name; required for gpt-5.x/o*
+    models and accepted by gpt-4.x/gpt-4o). Automatically retries without
+    `temperature` on models that reject non-default temps (gpt-5.5+), and
+    without `response_format` on models that reject it.
+    """
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a careful floor-plan annotation assistant. Prefer reading "
+                "text printed inside regions verbatim over guessing. Return JSON only."
+            ),
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": _png_to_data_url(png_bytes), "detail": "high"},
+                },
+            ],
+        },
+    ]
+    base: dict[str, Any] = {
         "model": model_name,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a careful floor-plan annotation assistant. Prefer reading "
-                    "text printed inside regions verbatim over guessing. Return JSON only."
-                ),
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": _png_to_data_url(png_bytes)}},
-                ],
-            },
-        ],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
+        "messages": messages,
+        "max_completion_tokens": max_completion_tokens,
     }
     if force_json_object:
-        kwargs["response_format"] = {"type": "json_object"}
-    resp = client.chat.completions.create(**kwargs)
-    return (resp.choices[0].message.content or "") if resp.choices else ""
+        base["response_format"] = {"type": "json_object"}
+    attempts: list[dict[str, Any]] = [
+        {**base, "temperature": temperature},
+        base,
+        {k: v for k, v in base.items() if k != "response_format"},
+    ]
+    last_exc: Exception | None = None
+    for i, kwargs in enumerate(attempts):
+        try:
+            resp = client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            msg = str(exc)
+            log.warning("cv_openai_refine attempt %d/%d failed (%s)",
+                        i + 1, len(attempts), msg[:200])
+            last_exc = exc
+            if "temperature" not in msg and "response_format" not in msg:
+                raise
+            continue
+        return (resp.choices[0].message.content or "") if resp.choices else ""
+    assert last_exc is not None
+    raise last_exc
 
 
 # ── Numbered overlay for global labeling (matches Gemini implementation) ────
@@ -175,7 +202,7 @@ def label_regions_global(
     regions: list[RoomRegion],
     *,
     client=None,
-    model_name: str = "gpt-4o",
+    model_name: str = "gpt-5.4",
     api_key: str | None = None,
 ) -> list[RoomRegion]:
     """
@@ -285,7 +312,7 @@ def find_missed_regions(
     existing: list[RoomRegion],
     *,
     client=None,
-    model_name: str = "gpt-4o",
+    model_name: str = "gpt-5.4",
     api_key: str | None = None,
     max_new: int = 50,
     min_overlay_long_side: int = 1400,

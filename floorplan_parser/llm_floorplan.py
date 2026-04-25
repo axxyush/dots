@@ -103,37 +103,51 @@ def _image_to_data_url(image_path: str, *, max_long_side: int = 1792) -> tuple[s
 def _build_prompt() -> str:
     allowed = ", ".join(_ALLOWED_TYPES)
     return (
-        "You are a senior architect reading a single floor plan image. Output "
-        "the complete structured JSON for every labeled room / space / "
-        "vertical circulation element / entrance visible in the plan.\n\n"
+        "You are a senior architect reading a single floor plan / venue map "
+        "image. Output the complete structured JSON for every labeled "
+        "room / space / seating section / vertical circulation element / "
+        "entrance visible.\n\n"
+        "WORKS FOR: building floor plans (schools, offices, hospitals, "
+        "houses, malls) AND venue / stadium / arena seating diagrams "
+        "(Pauley Pavilion, theaters, concert halls).\n\n"
         "GUIDELINES\n"
-        "  * Read printed room names VERBATIM from the plan and return them "
-        "in `label` (preserve capitalization, numbers, suffixes).\n"
+        "  * Read printed text VERBATIM from the plan and return it in "
+        "`label` (preserve capitalization, numbers, suffixes). Examples of "
+        "labels you MUST read: '101', '126A', 'STUDENTS', 'FACULTY / "
+        "STAFF', 'COURTSIDE', 'VISITOR', 'MEDIA', 'Classroom 201'.\n"
+        "  * For numbered seating sections in arenas/stadiums, `label` is "
+        "the section number EXACTLY as printed (e.g. '223A', '126A', "
+        "'101'). Use `type` = 'rest_area' for seating sections, 'corridor' "
+        "for walkways/concourses, 'entrance' for labeled entry points, "
+        "'office' for administrative areas, 'service_counter' for MEDIA "
+        "or similar.\n"
         "  * For `type`, pick the single best canonical category from: "
-        f"{allowed}.\n"
-        "  * Coordinates are PERCENTAGES of the full image (0-100) from the "
-        "top-left corner. `x`/`y` are the top-left corner of the bounding "
-        "box; `w`/`h` are width/height. Bounding boxes must tightly enclose "
-        "the room's outline — do NOT include the adjacent corridor.\n"
-        "  * Include hallways, corridors, stairs, elevators, restrooms, "
-        "lobbies, entrances — not just named rooms. Corridors should be "
-        "captured either as `corridor` type rooms OR in the `corridors` "
-        "array (centerline as 2+ points). Pick one; don't double-count.\n"
-        "  * `confidence`: 'high' if you clearly read the label; 'medium' if "
-        "inferred from icons/shape; 'low' if uncertain.\n"
-        "  * DO NOT invent rooms. If you are unsure whether a region is a "
-        "room, omit it.\n"
-        "  * DO NOT output overlapping duplicate boxes for the same room.\n"
-        "  * Assign ids of the form 'room_0', 'room_1', ... in reading order "
-        "(top-left to bottom-right).\n\n"
+        f"{allowed}. NEVER return 'unknown' unless you genuinely cannot "
+        "tell what the region is. If you can read a printed label, you can "
+        "almost always pick a type.\n"
+        "  * Coordinates are PERCENTAGES of the full image (0-100) from "
+        "the top-left corner. `x`/`y` are the top-left corner of the "
+        "bounding box; `w`/`h` are width/height. Boxes must tightly "
+        "enclose the region's outline.\n"
+        "  * BE EXHAUSTIVE. Cover every distinct colored/labeled region "
+        "you can see. For an arena with ~50 seating sections, return ~50 "
+        "room entries.\n"
+        "  * Include hallways, corridors, concourses, stairs, elevators, "
+        "restrooms, lobbies, entrances — not just named rooms.\n"
+        "  * `confidence`: 'high' if you clearly read the label; 'medium' "
+        "if inferred from icons/shape/color; 'low' if uncertain.\n"
+        "  * DO NOT invent regions. DO NOT output overlapping duplicate "
+        "boxes for the same region.\n"
+        "  * Assign ids of the form 'room_0', 'room_1', ... in reading "
+        "order (top-left to bottom-right).\n\n"
         "SCHEMA (return this JSON object only, no prose, no fences):\n"
         "{\n"
-        "  \"building_type\": \"<e.g. school, hospital, office, mall, house>\",\n"
+        "  \"building_type\": \"<e.g. school, arena, office, mall, house>\",\n"
         "  \"rooms\": [\n"
         "    {\n"
         "      \"id\": \"room_0\",\n"
-        "      \"type\": \"classroom\",\n"
-        "      \"label\": \"Classroom 201\",\n"
+        "      \"type\": \"rest_area\",\n"
+        "      \"label\": \"223A\",\n"
         "      \"position\": {\"x\": 12.3, \"y\": 45.6, \"w\": 8.1, \"h\": 6.7},\n"
         "      \"confidence\": \"high\"\n"
         "    }\n"
@@ -267,6 +281,67 @@ def _dedup_by_iou(objs: list[dict], iou_thresh: float = 0.55) -> list[dict]:
     return kept
 
 
+def _call_with_fallbacks(
+    client, model: str, prompt: str, data_url: str,
+) -> tuple[str, str | None]:
+    """Invoke chat.completions with graceful degradation on per-model quirks.
+
+    Known quirks we handle:
+      * gpt-5.x rejects `max_tokens` → we always send `max_completion_tokens`.
+      * gpt-5.5+ rejects `temperature != 1` → retry without temperature.
+      * Some models reject `response_format={"type": "json_object"}` → retry
+        without the response_format hint.
+    """
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a careful floor-plan annotation assistant. Return "
+                "JSON only. Read printed labels verbatim. Never invent rooms."
+            ),
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": data_url, "detail": "high"},
+                },
+            ],
+        },
+    ]
+    base: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "max_completion_tokens": 16384,
+        "response_format": {"type": "json_object"},
+    }
+    # Start with temperature=0 for determinism; drop it on models that reject.
+    attempts: list[dict[str, Any]] = [
+        {**base, "temperature": 0.0},
+        base,
+        {k: v for k, v in base.items() if k != "response_format"},
+    ]
+    last_exc: Exception | None = None
+    for i, kwargs in enumerate(attempts):
+        try:
+            resp = client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            msg = str(exc)
+            log.warning("LLM attempt %d/%d failed (%s)", i + 1, len(attempts), msg[:200])
+            last_exc = exc
+            # Only keep retrying on recoverable 400s.
+            if "temperature" not in msg and "response_format" not in msg:
+                raise
+            continue
+        raw = (resp.choices[0].message.content or "") if resp.choices else ""
+        finish = resp.choices[0].finish_reason if resp.choices else None
+        return raw, finish
+    assert last_exc is not None
+    raise last_exc
+
+
 def parse_floorplan_with_llm(
     image_path: str,
     *,
@@ -286,7 +361,7 @@ def parse_floorplan_with_llm(
     if not key:
         raise RuntimeError("OPENAI_API_KEY not set")
 
-    model = model_name or os.environ.get("OPENAI_PARSE_MODEL", "gpt-4o")
+    model = model_name or os.environ.get("OPENAI_PARSE_MODEL", "gpt-5.4")
     data_url, w, h = _image_to_data_url(image_path, max_long_side=max_long_side)
 
     # Local import so callers without the openai package can still import the
@@ -297,32 +372,12 @@ def parse_floorplan_with_llm(
     prompt = _build_prompt()
 
     log.info("parse_floorplan_with_llm: calling %s (img %dx%d)", model, w, h)
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a careful floor-plan annotation assistant. Return "
-                    "JSON only. Read printed labels verbatim. Never invent rooms."
-                ),
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": data_url, "detail": "high"},
-                    },
-                ],
-            },
-        ],
-        temperature=0.0,
-        max_tokens=8192,
-        response_format={"type": "json_object"},
-    )
-    raw = (resp.choices[0].message.content or "") if resp.choices else ""
+    raw, finish = _call_with_fallbacks(client, model, prompt, data_url)
+    if not raw:
+        raise RuntimeError(
+            f"LLM returned empty content (finish_reason={finish}). "
+            "Consider raising max_completion_tokens or using a different model."
+        )
     parsed = _extract_json(raw)
     if not isinstance(parsed, dict):
         raise RuntimeError(f"LLM returned non-object JSON (first 200ch): {raw[:200]!r}")

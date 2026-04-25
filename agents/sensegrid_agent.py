@@ -193,8 +193,13 @@ def _process_plans(
     blurred: bool,
     logger: logging.Logger,
 ) -> tuple[list[str], list[str], dict[str, int], list[dict], dict[str, int], str, list[str], str | None]:
-    """Run download → parse → reconstruct(blurred) → upload for each URL.
-    Returns (json_paths, png_urls, room_summary, ada_findings, ada_summary, ada_report_text, ada_pdf_urls, error_or_None)."""
+    """Run download → parse → generate_braille_map(blurred) → upload for each URL.
+    Returns (json_paths, png_urls, room_summary, ada_findings, ada_summary, ada_report_text, ada_pdf_urls, error_or_None).
+
+    ``png_urls`` contains the *tactile* braille map URLs — the primary
+    deliverable for a blind user. A separate text companion is produced
+    (and uploaded post-payment) so screen readers can narrate the layout.
+    """
     json_paths: list[str] = []
     png_urls: list[str] = []
     room_summary: dict[str, int] = {}
@@ -216,8 +221,19 @@ def _process_plans(
 
         parsed = dispatch("parse_floorplan_llm", {"image_path": dl["image_path"]})
         if "error" in parsed:
-            logger.warning("LLM extractor failed (%s) — falling back to CV", parsed["error"])
+            logger.warning(
+                "⚠️  LLM extractor failed — falling back to CV pipeline.\n"
+                "    reason: %s\n"
+                "    Check that OPENAI_API_KEY is set in .env AND that "
+                "python-dotenv is installed (`pip install python-dotenv`).",
+                parsed["error"],
+            )
             parsed = dispatch("parse_floorplan", {"image_path": dl["image_path"]})
+        else:
+            logger.info(
+                "✅  LLM extractor succeeded — %s rooms via %s",
+                parsed.get("room_count"), parsed.get("labeling_model"),
+            )
         if "error" in parsed:
             return [], [], {}, [], {}, "", [], f"Couldn't parse {url}: {parsed['error']}"
 
@@ -237,9 +253,12 @@ def _process_plans(
             if "error" not in up_pdf and up_pdf.get("url"):
                 ada_pdf_urls.append(up_pdf["url"])
 
-        rec = dispatch("reconstruct_floorplan", {"json_path": parsed["json_path"], "blurred": blurred})
+        rec = dispatch(
+            "generate_braille_map",
+            {"json_path": parsed["json_path"], "blurred": blurred},
+        )
         if "error" in rec:
-            return [], [], {}, [], {}, "", [], f"Render failed: {rec['error']}"
+            return [], [], {}, [], {}, "", [], f"Tactile map render failed: {rec['error']}"
 
         up = dispatch("upload_artifact", {"file_path": rec["png_path"]})
         if "error" in up:
@@ -378,14 +397,15 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
         plural = "s" if len(sess["urls"]) > 1 else ""
         user_addr = str(user_wallet.address())
         return (
-            f"Found {sum(room_summary.values())} rooms across {sess['n_plans']} plan{plural} "
+            f"Parsed {sum(room_summary.values())} rooms across {sess['n_plans']} plan{plural} "
             f"({rooms_str}).\n\n"
-            f"**Blurred preview:**\n{previews}\n\n"
+            f"**Tactile Braille map — blurred preview:**\n{previews}\n\n"
             f"{pdf_block}"
             f"{ada_fallback}"
             f"Reply **'yes'** to authorize payment of **{sess['quoted_fet_str']} test FET** "
-            f"— I'll execute the transfer on-chain (Dorado) automatically and deliver the "
-            f"full reconstruction. Reply 'no' to cancel.\n\n"
+            f"— I'll execute the transfer on-chain (Dorado) automatically, then deliver the "
+            f"sharp tactile map (print-ready for swell paper / embosser) plus a plain-text "
+            f"screen-reader companion. Reply 'no' to cancel.\n\n"
             f"_Demo wallet: `{user_addr}` — top up at {FAUCET_URL}/{user_addr} if needed._"
         )
 
@@ -442,31 +462,41 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
                 f"Reply 'yes' in a few seconds to retry."
             )
 
-        # Render unblurred + upload + deliver.
+        # Render unblurred tactile map + text companion + upload + deliver.
         final_urls: list[str] = []
+        txt_urls: list[str] = []
         json_urls: list[str] = []
         for jp in sess["json_paths"]:
-            rec = dispatch("reconstruct_floorplan", {"json_path": jp, "blurred": False})
+            rec = dispatch("generate_braille_map", {"json_path": jp, "blurred": False})
             if "error" in rec:
-                return f"Render failed after payment: {rec['error']}"
+                return f"Tactile map render failed after payment: {rec['error']}"
             up = dispatch("upload_artifact", {"file_path": rec["png_path"]})
             if "error" in up:
                 return f"Upload failed after payment: {up['error']}"
             final_urls.append(up["url"])
+            if rec.get("txt_path"):
+                up_txt = dispatch("upload_artifact", {"file_path": rec["txt_path"]})
+                if "error" not in up_txt:
+                    txt_urls.append(up_txt["url"])
             up_json = dispatch("upload_artifact", {"file_path": jp})
             if "error" not in up_json:
                 json_urls.append(up_json["url"])
 
         _clear_session(ctx, sender)
         finals = "\n".join(f"- {u}" for u in final_urls)
+        txts = "\n".join(f"- {u}" for u in txt_urls) if txt_urls else ""
         jsons = "\n".join(f"- {u}" for u in json_urls) if json_urls else ""
         plural = "s" if len(final_urls) > 1 else ""
         msg = (
             f"Payment of {sess['quoted_fet_str']} test FET confirmed on-chain "
-            f"(tx `{tx_hash}`).\n\nFinal reconstruction{plural}:\n{finals}"
+            f"(tx `{tx_hash}`).\n\n"
+            f"**Tactile Braille map{plural}** (print on swell paper or send to a "
+            f"tactile embosser):\n{finals}"
         )
+        if txts:
+            msg += f"\n\n**Screen-reader companion (plain text):**\n{txts}"
         if jsons:
-            msg += f"\n\nStructured JSON:\n{jsons}"
+            msg += f"\n\n**Structured JSON:**\n{jsons}"
         if sess.get("ada_pdf_urls"):
             msg += "\n\nADA report (PDF):\n" + "\n".join(f"- {u}" for u in sess["ada_pdf_urls"])
         else:
@@ -541,8 +571,66 @@ async def on_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
 agent.include(protocol, publish_manifest=True)
 
 
+def _log_parser_health() -> None:
+    """At startup, print which parser path will run and flag any gotchas.
+
+    Without this banner, `parse_floorplan_llm` errors silently get swallowed
+    by the agent's CV fallback, and the user has no idea their LLM path is
+    broken until all rooms come back as "Unknown".
+    """
+    import sys
+    from pathlib import Path as _Path
+
+    repo_root = _Path(__file__).resolve().parents[1]
+    parser_dir = repo_root / "floorplan_parser"
+    if str(parser_dir) not in sys.path:
+        sys.path.insert(0, str(parser_dir))
+
+    bar = "═" * 68
+    log.info(bar)
+    log.info(" SenseGrid parser self-check")
+    log.info(bar)
+
+    openai_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+    gemini_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    log.info(" OPENAI_API_KEY ....... %s",
+             f"set (prefix {openai_key[:10]}…, len {len(openai_key)})"
+             if openai_key else "MISSING — LLM path disabled")
+    log.info(" GEMINI_API_KEY ....... %s",
+             f"set (len {len(gemini_key)})" if gemini_key else "not set")
+    log.info(" OPENAI_PARSE_MODEL ... %s", os.environ.get("OPENAI_PARSE_MODEL", "gpt-5.4 (default)"))
+
+    try:
+        import openai  # noqa: F401
+        log.info(" openai package ....... ok (v%s)", openai.__version__)
+    except Exception as exc:
+        log.error(" openai package ....... MISSING (%s) — run: pip install -r requirements.txt", exc)
+
+    try:
+        import dotenv  # noqa: F401
+        log.info(" python-dotenv ........ ok")
+    except Exception:
+        log.error(" python-dotenv ........ MISSING — .env will NOT load. "
+                  "Run: pip install python-dotenv")
+
+    try:
+        from llm_floorplan import parse_floorplan_with_llm  # noqa: F401
+        log.info(" parse_floorplan_llm .. importable")
+    except Exception as exc:
+        log.error(" parse_floorplan_llm .. IMPORT FAILED (%s)", exc)
+
+    if openai_key:
+        log.info(" → Primary parser:  OpenAI end-to-end (parse_floorplan_llm)")
+    elif gemini_key:
+        log.info(" → Primary parser:  CV + Gemini labeling (fallback path)")
+    else:
+        log.warning(" → Primary parser:  CV only — all rooms will be labeled 'Unknown'!")
+    log.info(bar)
+
+
 if __name__ == "__main__":
     log.info("SenseGrid starting.")
+    _log_parser_health()
     log.info("Service wallet (receives payments): %s", agent.wallet.address())
     log.info("Demo user-proxy wallet (auto-pays):  %s", user_wallet.address())
     log.info("Fund the user-proxy once at: %s/%s", FAUCET_URL, user_wallet.address())

@@ -38,6 +38,16 @@ from ada_advisor import generate_ada_recommendations  # noqa: E402
 from render_map import render_floor_plan  # noqa: E402
 
 try:
+    from braille_map import render_tactile_map  # noqa: E402
+    _BRAILLE_IMPORT_OK = True
+except Exception as _braille_import_exc:  # pragma: no cover
+    render_tactile_map = None  # type: ignore
+    _BRAILLE_IMPORT_OK = False
+    logging.getLogger("sensegrid.tools").warning(
+        "Tactile braille map module unavailable: %s", _braille_import_exc
+    )
+
+try:
     from cv_gemini_refine import label_regions_global as _gemini_label_global  # noqa: E402
     _GEMINI_IMPORT_OK = True
 except Exception as _gemini_import_exc:  # pragma: no cover
@@ -141,7 +151,7 @@ def parse_floorplan(image_path: str) -> dict:
         labeling_error = "no regions to label"
     elif openai_key and _OPENAI_IMPORT_OK:
         labeling_provider = "openai"
-        labeling_model = os.environ.get("OPENAI_LABEL_MODEL", "gpt-4o")
+        labeling_model = os.environ.get("OPENAI_LABEL_MODEL", "gpt-5.4")
         try:
             log.info("parse_floorplan: calling OpenAI global labeling via %s…", labeling_model)
             regions = _openai_label_global(
@@ -389,7 +399,7 @@ def parse_floorplan_llm(image_path: str) -> dict:
     base.update(
         {
             "labeling_provider": "openai_end_to_end",
-            "labeling_model": os.environ.get("OPENAI_PARSE_MODEL", "gpt-4o"),
+            "labeling_model": os.environ.get("OPENAI_PARSE_MODEL", "gpt-5.4"),
             "labeling_status": "ok" if objs else "returned_no_rooms",
             "labeling_rooms_labeled": sum(
                 1 for o in objs if o.get("type") and o["type"] != "unknown"
@@ -439,6 +449,73 @@ def reconstruct_floorplan(json_path: str, blurred: bool = False) -> dict:
         "png_path": str(out_path),
         "width": img.width,
         "height": img.height,
+        "blurred": blurred,
+    }
+
+
+# ── Tool 3b: generate_braille_map ────────────────────────────────────────────
+
+
+def generate_braille_map(json_path: str, blurred: bool = False) -> dict:
+    """Render the parsed JSON as a *tactile Braille map* for a blind user.
+
+    Produces two files:
+      * ``<stem>_tactile.png`` — high-contrast map with distinct hatched
+        textures per room category, real Braille dots for every room
+        label, a Braille-labelled legend panel, compass rose + scale bar.
+        Designed to be printed on swell paper or sent to a tactile
+        embosser.
+      * ``<stem>_tactile.txt`` — plain-text screen-reader companion that
+        walks through the building by compass zone.
+
+    When ``blurred=True`` the PNG is returned with a heavy Gaussian blur
+    so it can be shared as a teaser preview before payment is settled;
+    the text companion is omitted in that case.
+    """
+    p = Path(json_path)
+    if not p.exists():
+        return {"error": f"json not found: {json_path}"}
+    if not _BRAILLE_IMPORT_OK or render_tactile_map is None:
+        return {"error": "braille_map module unavailable (see server logs)"}
+
+    data = json.loads(p.read_text(encoding="utf-8"))
+    fp = data.get("floor_plan") or data
+
+    stem = p.stem.replace("_result", "")
+    suffix_png = "_tactile_preview.png" if blurred else "_tactile.png"
+    png_path = ARTIFACT_DIR / f"{stem}{suffix_png}"
+    txt_path = ARTIFACT_DIR / f"{stem}_tactile.txt"
+
+    title = fp.get("source_image") or stem
+    try:
+        render_tactile_map(
+            floor_plan=fp,
+            output_png=png_path,
+            output_txt=txt_path,
+            title=title,
+        )
+    except Exception as exc:
+        log.exception("tactile map render failed")
+        return {"error": f"tactile map render failed: {exc}"}
+
+    if blurred:
+        try:
+            from PIL import Image, ImageFilter  # noqa: WPS433
+            img = Image.open(png_path)
+            # Scale blur radius with image width so the paywall preview
+            # stays obviously blurred at any display resolution.
+            radius = max(30, img.width // 40)
+            img = img.filter(ImageFilter.GaussianBlur(radius=radius))
+            img.save(png_path, format="PNG")
+        except Exception as exc:
+            log.warning("tactile preview blur failed: %s", exc)
+
+    log.info("tactile map: %s → %s / %s (blurred=%s)",
+             json_path, png_path, txt_path, blurred)
+    return {
+        "png_path": str(png_path),
+        "txt_path": str(txt_path) if not blurred else None,
+        "rooms_rendered": len(fp.get("rooms", []) or []),
         "blurred": blurred,
     }
 
@@ -567,6 +644,26 @@ TOOL_SPECS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "generate_braille_map",
+            "description": (
+                "Generate a tactile Braille map (PNG + text companion) from a "
+                "parsed floor-plan JSON. Use this instead of reconstruct_floorplan "
+                "when the user wants an accessibility/tactile output for a blind "
+                "reader. The PNG is print-ready for swell paper / tactile embossers."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "json_path": {"type": "string", "description": "Absolute path to a result.json produced by parse_floorplan."},
+                    "blurred": {"type": "boolean", "description": "If true, return a blurred teaser preview (paywall-safe)."},
+                },
+                "required": ["json_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "upload_artifact",
             "description": (
                 "Upload a local file (PNG/JSON) to a public no-auth host and return "
@@ -590,6 +687,7 @@ _DISPATCH = {
     "parse_floorplan": parse_floorplan,
     "parse_floorplan_llm": parse_floorplan_llm,
     "reconstruct_floorplan": reconstruct_floorplan,
+    "generate_braille_map": generate_braille_map,
     "upload_artifact": upload_artifact,
 }
 
