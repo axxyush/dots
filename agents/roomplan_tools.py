@@ -26,8 +26,8 @@ try:
 except ImportError:
     pass
 
-from braille_map import generate_braille_map  # noqa: E402
-from roomplan_to_floorplan import roomplan_json_to_floorplan  # noqa: E402
+from roomplan_to_layout_2d import roomplan_json_to_layout_2d  # noqa: E402
+from connectdots_pdf import generate_tactile_pdf  # noqa: E402
 
 log = logging.getLogger("roomplan.tools")
 
@@ -52,53 +52,41 @@ def download_json(url: str) -> dict:
     return {"json_path": path_str, "bytes": size}
 
 
-def convert_roomplan_json(roomplan_json: str, source_name: str = "roomplan.json") -> dict:
-    """
-    Convert RoomPlan JSON (string) → normalized floorplan result.json written to disk.
-    """
+def tactile_pdf_from_roomplan_json(roomplan_json: str, source_name: str = "roomplan.json") -> dict:
+    """Convert RoomPlan JSON (string) → tactile PDF (ConnectDots-style)."""
     try:
         roomplan = json.loads(roomplan_json)
     except Exception as exc:
         return {"error": f"Invalid JSON: {exc}"}
 
     try:
-        converted = roomplan_json_to_floorplan(roomplan, source_name=source_name, use_llm=True)
+        layout, metadata = roomplan_json_to_layout_2d(roomplan)
     except Exception as exc:
         return {"error": f"Conversion failed: {exc}"}
 
-    out_path = ARTIFACT_DIR / (Path(source_name).stem + "_floorplan_result.json")
-    out_path.write_text(json.dumps(converted, indent=2), encoding="utf-8")
-    fp = (converted or {}).get("floor_plan") or {}
-    rooms = fp.get("rooms") or []
-    doors = fp.get("doors") or []
+    out_pdf = ARTIFACT_DIR / (Path(source_name).stem + "_tactile.pdf")
+    # For tactile maps, avoid numeric legends; keep single page.
+    pdf_path = generate_tactile_pdf(
+        output_pdf_path=str(out_pdf),
+        layout=layout,
+        metadata=metadata,
+        room_id=Path(source_name).stem,
+        number_objects=False,
+        include_legend_page=False,
+    )
+
     return {
-        "json_path": str(out_path),
-        "room_count": len(rooms),
-        "door_count": len(doors),
+        "pdf_path": str(pdf_path),
+        "layout_2d": layout,
+        "metadata": metadata,
         "source_name": source_name,
+        "object_count": len(layout.get("objects") or []),
     }
 
 
-def braille_map_from_roomplan_json(roomplan_json: str, source_name: str = "roomplan.json", cols: int = 90) -> dict:
-    conv = convert_roomplan_json(roomplan_json, source_name=source_name)
-    if "error" in conv:
-        return conv
-    json_path = conv["json_path"]
-    stem = Path(json_path).stem.replace("_floorplan_result", "")
-    out_txt = ARTIFACT_DIR / f"{stem}_braille_map.txt"
-    out_leg = ARTIFACT_DIR / f"{stem}_braille_map.legend.txt"
-    out_png = ARTIFACT_DIR / f"{stem}_braille_map.png"
-    res = generate_braille_map(
-        Path(json_path),
-        out_txt=out_txt,
-        out_legend=out_leg,
-        out_png=out_png,
-        cols=int(cols),
-        llm_refine=True,
-    )
-    res["floorplan_json_path"] = json_path
-    res["source_name"] = source_name
-    return res
+def tactile_map_from_roomplan_json(roomplan_json: str, source_name: str = "roomplan.json") -> dict:
+    """Alias name for agent/tooling."""
+    return tactile_pdf_from_roomplan_json(roomplan_json, source_name=source_name)
 
 
 def upload_artifact(file_path: str) -> dict:
@@ -148,17 +136,16 @@ TOOL_SPECS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "braille_map_from_roomplan_json",
+            "name": "tactile_map_from_roomplan_json",
             "description": (
-                "Convert Apple RoomPlan JSON (string) into a normalized floorplan and "
-                "generate Braille map artifacts (txt + legend + png)."
+                "Convert Apple RoomPlan JSON (string) into a tactile PDF map using "
+                "a deterministic geometry conversion (no LLM)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "roomplan_json": {"type": "string", "description": "The raw RoomPlan JSON string."},
                     "source_name": {"type": "string", "description": "Filename label for the source JSON.", "default": "roomplan.json"},
-                    "cols": {"type": "integer", "default": 90},
                 },
                 "required": ["roomplan_json"],
             },
@@ -181,7 +168,7 @@ TOOL_SPECS: list[dict] = [
 
 _DISPATCH = {
     "download_json": download_json,
-    "braille_map_from_roomplan_json": braille_map_from_roomplan_json,
+    "tactile_map_from_roomplan_json": tactile_map_from_roomplan_json,
     "upload_artifact": upload_artifact,
 }
 

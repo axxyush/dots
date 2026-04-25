@@ -11,7 +11,10 @@ This module is adapted from `ConnectDots/braillemap-agents/agent_map.py` but:
 import math
 from typing import Any, Dict, List, Tuple
 
-from pybraille import convertText as to_braille  # type: ignore
+try:
+    from pybraille import convertText as to_braille  # type: ignore
+except Exception:  # pragma: no cover
+    to_braille = None  # type: ignore
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -148,7 +151,7 @@ def _sanitize_for_pybraille(text: str) -> str:
 def _draw_braille_text(c: canvas.Canvas, x: float, y: float, text: str, *, size: float = 20) -> float:
     safe = _sanitize_for_pybraille(text)
     try:
-        braille = to_braille(safe)
+        braille = to_braille(safe) if to_braille else safe
     except Exception:
         braille = safe
     if _BRAILLE_FONT_AVAILABLE:
@@ -166,6 +169,8 @@ def generate_tactile_pdf(
     layout: Dict[str, Any],
     metadata: Dict[str, Any],
     room_id: str = "room",
+    number_objects: bool = True,
+    include_legend_page: bool = True,
 ) -> str:
     """
     layout format (ConnectDots `layout_2d`):
@@ -257,14 +262,15 @@ def generate_tactile_pdf(
         ow = float(obj["width"]) * scale
         od = float(obj["depth"]) * scale
         _draw_dot_rect(c, ox, oy, ow, od, DOT_SPACING_PTS, OBJECT_DOT_RADIUS)
-        num = int(obj.get("index", 0)) + 1
-        c.setFont("Helvetica-Bold", 11)
-        label_x = ox + max(ow / 2, 8) + 3
-        label_y = oy - 4
-        c.drawString(label_x, label_y, str(num))
-        if _BRAILLE_FONT_AVAILABLE:
-            c.setFont(_BRAILLE_FONT_NAME, 16)
-            c.drawString(label_x + 12, label_y - 2, to_braille(str(num)))
+        if number_objects:
+            num = int(obj.get("index", 0)) + 1
+            c.setFont("Helvetica-Bold", 11)
+            label_x = ox + max(ow / 2, 8) + 3
+            label_y = oy - 4
+            c.drawString(label_x, label_y, str(num))
+            if _BRAILLE_FONT_AVAILABLE:
+                c.setFont(_BRAILLE_FONT_NAME, 16)
+                c.drawString(label_x + 12, label_y - 2, to_braille(str(num)))
 
     # scale bar (1m)
     c.setFillColorRGB(0, 0, 0)
@@ -289,98 +295,102 @@ def generate_tactile_pdf(
     _draw_dot_line(c, margin + 110, key_y + 2, margin + 130, key_y + 2, 4, 1.0, dashed=True)
     c.drawString(margin + 134, key_y - 1, "Window")
     _draw_dot_rect(c, margin + 185, key_y + 2, 10, 6, 4, 1.0)
-    c.drawString(margin + 194, key_y - 1, "Object (numbered)")
+    c.drawString(margin + 194, key_y - 1, "Object" + (" (numbered)" if number_objects else ""))
 
-    # PAGE 2: legend
-    c.showPage()
-    c.setFillColorRGB(0, 0, 0)
-    c.setFont("Helvetica-Bold", 18)
-    c.drawString(margin, page_h - margin, "Legend")
-    _draw_braille_text(c, margin + 80, page_h - margin, "Legend", size=22)
-
-    c.setFont("Helvetica", 10)
-    sub2 = f"{room_label} — {len(objects)} object(s), {len(doors)} door(s), {len(windows)} window(s)"
-    c.drawString(margin, page_h - margin - 20, sub2)
-
-    y = page_h - margin - 55
-    c.setFont("Helvetica-Bold", 13)
-    c.drawString(margin, y, "Objects")
-    _draw_braille_text(c, margin + 65, y, "objects", size=18)
-    y -= 8
-
-    for obj in objects:
-        if y < margin + 80:
-            c.showPage()
-            c.setFillColorRGB(0, 0, 0)
-            y = page_h - margin
-
-        num = int(obj.get("index", 0)) + 1
-        label = str(obj.get("category") or "unknown")
-        pos = f"({float(obj['x']):.1f}m, {float(obj['y']):.1f}m)"
-        size = f"{float(obj['width']):.1f} x {float(obj['depth']):.1f}m"
-
-        y -= 16
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(margin, y, f"{num}.")
-        c.setFont("Helvetica", 11)
-        c.drawString(margin + 16, y, f"  {label}")
-
-        y -= 13
-        c.setFont("Helvetica", 9)
-        c.setFillColorRGB(0.3, 0.3, 0.3)
-        c.drawString(margin + 16, y, f"Position: {pos}  •  Size: {size}")
+    if include_legend_page:
+        # PAGE 2: legend
+        c.showPage()
         c.setFillColorRGB(0, 0, 0)
+        c.setFont("Helvetica-Bold", 18)
+        c.drawString(margin, page_h - margin, "Legend")
+        _draw_braille_text(c, margin + 80, page_h - margin, "Legend", size=22)
 
-        y -= 22
-        _draw_braille_text(c, margin + 16, y, f"{num} {label}", size=18)
-        y -= 6
+        c.setFont("Helvetica", 10)
+        sub2 = f"{room_label} — {len(objects)} object(s), {len(doors)} door(s), {len(windows)} window(s)"
+        c.drawString(margin, page_h - margin - 20, sub2)
 
-    if doors or windows:
-        if y < margin + 100:
-            c.showPage()
-            c.setFillColorRGB(0, 0, 0)
-            y = page_h - margin
-        y -= 20
+        y = page_h - margin - 55
         c.setFont("Helvetica-Bold", 13)
-        c.drawString(margin, y, "Openings")
-        _draw_braille_text(c, margin + 75, y, "openings", size=18)
+        c.drawString(margin, y, "Objects")
+        _draw_braille_text(c, margin + 65, y, "objects", size=18)
+        y -= 8
 
-        for door in doors:
-            y -= 20
-            if y < margin + 40:
+        for obj in objects:
+            if y < margin + 80:
                 c.showPage()
                 c.setFillColorRGB(0, 0, 0)
                 y = page_h - margin
-            tag = "Entrance" if door.get("is_entrance") else "Door"
-            pos = f"({float(door['x']):.1f}m, {float(door['y']):.1f}m)"
-            width = f"{float(door['width']):.1f}m wide"
-            if door.get("is_entrance"):
-                _draw_star(c, margin + 6, y + 3, 5)
+
+            num = int(obj.get("index", 0)) + 1
+            label = str(obj.get("category") or "unknown")
+            pos = f"({float(obj['x']):.1f}m, {float(obj['y']):.1f}m)"
+            size = f"{float(obj['width']):.1f} x {float(obj['depth']):.1f}m"
+
+            y -= 16
+            c.setFont("Helvetica-Bold", 11)
+            c.drawString(margin, y, f"{num}." if number_objects else "•")
+            c.setFont("Helvetica", 11)
+            c.drawString(margin + 16, y, f"  {label}")
+
+            y -= 13
+            c.setFont("Helvetica", 9)
+            c.setFillColorRGB(0.3, 0.3, 0.3)
+            c.drawString(margin + 16, y, f"Position: {pos}  •  Size: {size}")
+            c.setFillColorRGB(0, 0, 0)
+
+            if number_objects:
+                y -= 22
+                _draw_braille_text(c, margin + 16, y, f"{num} {label}", size=18)
+                y -= 6
             else:
-                _draw_triangle(c, margin + 6, y + 3, 4)
-            c.setFont("Helvetica", 11)
-            c.drawString(margin + 16, y, f"  {tag} at {pos}, {width}")
-            y -= 22
-            _draw_braille_text(c, margin + 16, y, f"{tag} {pos}", size=18)
+                y -= 10
 
-        for win in windows:
-            y -= 20
-            if y < margin + 40:
+        if doors or windows:
+            if y < margin + 100:
                 c.showPage()
                 c.setFillColorRGB(0, 0, 0)
                 y = page_h - margin
-            pos = f"({float(win['x']):.1f}m, {float(win['y']):.1f}m)"
-            width = f"{float(win['width']):.1f}m wide"
-            _draw_circle_outline(c, margin + 6, y + 3, 4, num_dots=8)
-            c.setFont("Helvetica", 11)
-            c.drawString(margin + 16, y, f"  Window at {pos}, {width}")
-            y -= 22
-            _draw_braille_text(c, margin + 16, y, f"window {pos}", size=18)
+            y -= 20
+            c.setFont("Helvetica-Bold", 13)
+            c.drawString(margin, y, "Openings")
+            _draw_braille_text(c, margin + 75, y, "openings", size=18)
 
-    if entrance and entrance.get("kind") == "wall_midpoint":
-        y -= 20
-        c.setFont("Helvetica-Oblique", 9)
-        c.drawString(margin, y, "(No door detected — entrance approximated as midpoint of longest wall.)")
+            for door in doors:
+                y -= 20
+                if y < margin + 40:
+                    c.showPage()
+                    c.setFillColorRGB(0, 0, 0)
+                    y = page_h - margin
+                tag = "Entrance" if door.get("is_entrance") else "Door"
+                pos = f"({float(door['x']):.1f}m, {float(door['y']):.1f}m)"
+                width = f"{float(door['width']):.1f}m wide"
+                if door.get("is_entrance"):
+                    _draw_star(c, margin + 6, y + 3, 5)
+                else:
+                    _draw_triangle(c, margin + 6, y + 3, 4)
+                c.setFont("Helvetica", 11)
+                c.drawString(margin + 16, y, f"  {tag} at {pos}, {width}")
+                y -= 22
+                _draw_braille_text(c, margin + 16, y, f"{tag} {pos}", size=18)
+
+            for win in windows:
+                y -= 20
+                if y < margin + 40:
+                    c.showPage()
+                    c.setFillColorRGB(0, 0, 0)
+                    y = page_h - margin
+                pos = f"({float(win['x']):.1f}m, {float(win['y']):.1f}m)"
+                width = f"{float(win['width']):.1f}m wide"
+                _draw_circle_outline(c, margin + 6, y + 3, 4, num_dots=8)
+                c.setFont("Helvetica", 11)
+                c.drawString(margin + 16, y, f"  Window at {pos}, {width}")
+                y -= 22
+                _draw_braille_text(c, margin + 16, y, f"window {pos}", size=18)
+
+        if entrance and entrance.get("kind") == "wall_midpoint":
+            y -= 20
+            c.setFont("Helvetica-Oblique", 9)
+            c.drawString(margin, y, "(No door detected — entrance approximated as midpoint of longest wall.)")
 
     c.save()
     return output_pdf_path
