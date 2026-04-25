@@ -87,3 +87,15 @@ def build_system_prompt(layout: dict[str, Any], metadata: dict[str, Any]) -> str
         "- Keep replies under 3 short sentences unless asked for a full description.\n"
     )
 
+
+def build_system_prompt_from_context(context_text: str, metadata: dict[str, Any]) -> str:
+    label = (metadata.get("room_name") or metadata.get("space_name") or "space").strip()
+    return (
+        "You are an accessibility guide for a blind user holding a tactile map.\n"
+        f"Map: {label}\n\n"
+        "You are given a structured description of the map below. Use ONLY this information.\n"
+        "If asked about something not present (e.g., stairs) and the context doesn't mention it, say it is not detected / unknown.\n"
+        "Answer with natural directions and counts; keep replies short.\n\n"
+        f"MAP CONTEXT:\n{context_text.strip()}\n"
+    )
+
