@@ -1,0 +1,15 @@
+uagents>=0.22.0
+uagents-core>=0.3.0
+google-generativeai>=0.8.3
+google-genai>=1.73.0
+elevenlabs>=1.10.0
+reportlab>=4.2.5
+cloudinary>=1.41.0
+python-dotenv>=1.0.1
+pydantic>=2.9.0
+requests>=2.32.0
+pillow>=11.0.0
+numpy>=1.26.0
+pybraille>=1.0.0
+fastapi>=0.115.0
+uvicorn>=0.32.0

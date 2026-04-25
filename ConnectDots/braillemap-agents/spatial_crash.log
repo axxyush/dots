@@ -1,0 +1,200 @@
+════════════════════════════════════════════════════════════
+ BrailleMap Spatial Processor (Agent 1)
+ Address        : agent1qd0wnp39wq0ynzwhun5gmejz6cfvq5end9z7x0ex49q8eapa2yl270ts0fh
+ Port           : 8001
+ → Enricher     : agent1qvzj6hgcxr2mt4vjdmkcdw6tgnryjwtxn74gfvtgqh37nc7kdg3w7d2cksp
+ Backend        : http://localhost:8000
+ Chat Protocol  : enabled (ASI:One compatible)
+════════════════════════════════════════════════════════════
+INFO:     [braillemap_spatial_processor]: Starting agent with address: agent1qd0wnp39wq0ynzwhun5gmejz6cfvq5end9z7x0ex49q8eapa2yl270ts0fh
+INFO:     [braillemap_spatial_processor]: Agent inspector available at https://agentverse.ai/inspect/?uri=http%3A//127.0.0.1%3A8001&address=agent1qd0wnp39wq0ynzwhun5gmejz6cfvq5end9z7x0ex49q8eapa2yl270ts0fh
+INFO:     [braillemap_spatial_processor]: Starting server on http://0.0.0.0:8001 (Press CTRL+C to quit)
+ERROR:    [Errno 48] error while attempting to bind on address ('0.0.0.0', 8001): address already in use
+Exception ignored in: <coroutine object TCPConnector._wrap_create_connection at 0x112099bc0>
+Traceback (most recent call last):
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/aiohttp/connector.py", line 1310, in _wrap_create_connection
+    sock = await aiohappyeyeballs.start_connection(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/aiohappyeyeballs/impl.py", line 87, in start_connection
+    sock, _, _ = await _staggered.staggered_race(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/aiohappyeyeballs/_staggered.py", line 203, in staggered_race
+    task.cancel()
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py", line 761, in call_soon
+    self._check_closed()
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py", line 519, in _check_closed
+    raise RuntimeError('Event loop is closed')
+RuntimeError: Event loop is closed
+ERROR:asyncio:Task was destroyed but it is pending!
+task: <Task cancelling name='Task-13' coro=<staggered_race.<locals>.run_one_coro() running at /Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/aiohappyeyeballs/_staggered.py:132> wait_for=<Future cancelled>>
+ERROR:asyncio:Task exception was never retrieved
+future: <Task finished name='Task-8' coro=<Agent.start_server() done, defined at /Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uagents/agent.py:1325> exception=SystemExit(1)>
+Traceback (most recent call last):
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uvicorn/server.py", line 172, in startup
+    server = await loop.create_server(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py", line 1525, in create_server
+    raise OSError(err.errno, 'error while attempting '
+OSError: [Errno 48] error while attempting to bind on address ('0.0.0.0', 8001): address already in use
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uagents/agent.py", line 1390, in run
+    self._loop.run_until_complete(self.run_async())
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py", line 640, in run_until_complete
+    self.run_forever()
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py", line 607, in run_forever
+    self._run_once()
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py", line 1922, in _run_once
+    handle._run()
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uagents/agent.py", line 1334, in start_server
+    await self._server.serve()
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uagents/asgi.py", line 198, in serve
+    await self._server.serve()
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uvicorn/server.py", line 79, in serve
+    await self._serve(sockets)
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uvicorn/server.py", line 94, in _serve
+    await self.startup(sockets=sockets)
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uvicorn/server.py", line 182, in startup
+    sys.exit(1)
+SystemExit: 1
+INFO:     [braillemap_spatial_processor]: Shutting down agent...
+ERROR:    [braillemap_spatial_processor]: Error during shutdown: no running event loop
+Traceback (most recent call last):
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uagents/agent.py", line 1352, in run_async
+    await asyncio.gather(*tasks, return_exceptions=True)
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uagents/agent.py", line 1358, in run_async
+    await asyncio.wait_for(
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/tasks.py", line 439, in wait_for
+    loop = events.get_running_loop()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: no running event loop
+/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uagents/agent.py:1366: RuntimeWarning: coroutine 'Agent._shutdown' was never awaited
+  self._logger.exception(f"Error during shutdown: {ex}")
+RuntimeWarning: Enable tracemalloc to get the object allocation traceback
+Exception ignored in: <coroutine object Agent.run_async at 0x10654b810>
+Traceback (most recent call last):
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uagents/agent.py", line 1376, in run_async
+    task.cancel()
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py", line 761, in call_soon
+    self._check_closed()
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py", line 519, in _check_closed
+    raise RuntimeError('Event loop is closed')
+RuntimeError: Event loop is closed
+ERROR:asyncio:Task was destroyed but it is pending!
+task: <Task pending name='Task-10' coro=<TCPConnector._resolve_host_with_throttle() running at /Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/aiohttp/connector.py:1221> wait_for=<Future pending cb=[_chain_future.<locals>._call_check_cancel() at /Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/futures.py:387, Task.task_wakeup()]> cb=[set.discard(), shield.<locals>._inner_done_callback() at /Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/tasks.py:881]>
+ERROR:asyncio:Task was destroyed but it is pending!
+task: <Task pending name='Task-1' coro=<Agent.publish_manifest() running at /Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uagents/agent.py:1117> wait_for=<Future pending cb=[Task.task_wakeup()]>>
+ERROR:asyncio:Task was destroyed but it is pending!
+task: <Task pending name='Task-7' coro=<Agent.run_startup_tasks() running at /Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uagents/agent.py:1289> wait_for=<Future pending cb=[shield.<locals>._outer_done_callback() at /Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/tasks.py:898, Task.task_wakeup()]> cb=[Agent.setup.<locals>.<lambda>() at /Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uagents/agent.py:1268]>
+Exception ignored in: <coroutine object Agent.publish_manifest at 0x1125d3010>
+RuntimeError: coroutine ignored GeneratorExit
+ERROR:asyncio:Task was destroyed but it is pending!
+task: <Task pending name='Task-4' coro=<Agent._schedule_registration() running at /Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uagents/agent.py:895> wait_for=<Future pending cb=[shield.<locals>._outer_done_callback() at /Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/tasks.py:898, Task.task_wakeup()]>>
+ERROR:asyncio:Task was destroyed but it is pending!
+task: <Task pending name='Task-5' coro=<Dispenser.run() running at /Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uagents/communication.py:85> wait_for=<Future pending cb=[Task.task_wakeup()]>>
+ERROR:asyncio:Task was destroyed but it is pending!
+task: <Task cancelling name='Task-6' coro=<Agent._process_message_queue() running at /Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uagents/agent.py:1553> wait_for=<Future cancelled>>
+--- Logging error ---
+Traceback (most recent call last):
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uagents/registration.py", line 92, in almanac_api_post
+    async with session.post(
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uagents/registration.py", line 149, in register
+    success = await almanac_api_post(
+              ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uagents/registration.py", line 89, in almanac_api_post
+    async with aiohttp.ClientSession() as session:
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/aiohttp/client.py", line 1494, in __aexit__
+    await self.close()
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/aiohttp/client.py", line 1360, in close
+    await self._connector.close()
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/aiohttp/connector.py", line 1086, in close
+    await super().close(abort_ssl=abort_ssl or self._ssl_shutdown_timeout == 0)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/aiohttp/connector.py", line 504, in close
+    if not (waiters := self._close(abort_ssl=abort_ssl)):
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/aiohttp/connector.py", line 1068, in _close
+    t.cancel()
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py", line 761, in call_soon
+    self._check_closed()
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py", line 519, in _check_closed
+    raise RuntimeError('Event loop is closed')
+RuntimeError: Event loop is closed
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/logging/__init__.py", line 1110, in emit
+    msg = self.format(record)
+          ^^^^^^^^^^^^^^^^^^^
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/logging/__init__.py", line 953, in format
+    return fmt.format(record)
+           ^^^^^^^^^^^^^^^^^^
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/logging/__init__.py", line 690, in format
+    s = self.formatMessage(record)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uvicorn/logging.py", line 56, in formatMessage
+    recordcopy = copy(record)
+                 ^^^^^^^^^^^^
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/copy.py", line 92, in copy
+    rv = reductor(4)
+         ^^^^^^^^^^^
+ImportError: sys.meta_path is None, Python is likely shutting down
+Call stack:
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uagents/registration.py", line 162, in register
+    self._logger.warning(
+Message: 'Registration on Almanac API failed: Event loop is closed'
+Arguments: ()
+--- Logging error ---
+Traceback (most recent call last):
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uagents/agent.py", line 895, in _schedule_registration
+    await self.register()
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/logging/__init__.py", line 1110, in emit
+    msg = self.format(record)
+          ^^^^^^^^^^^^^^^^^^^
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/logging/__init__.py", line 953, in format
+    return fmt.format(record)
+           ^^^^^^^^^^^^^^^^^^
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/logging/__init__.py", line 690, in format
+    s = self.formatMessage(record)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uvicorn/logging.py", line 56, in formatMessage
+    recordcopy = copy(record)
+                 ^^^^^^^^^^^^
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/copy.py", line 92, in copy
+    rv = reductor(4)
+         ^^^^^^^^^^^
+ImportError: sys.meta_path is None, Python is likely shutting down
+Call stack:
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uagents/agent.py", line 906, in _schedule_registration
+    self._logger.info("Stopping registration loop.")
+Message: 'Stopping registration loop.'
+Arguments: ()
+Exception ignored in: <coroutine object Dispenser.run at 0x1125d3ab0>
+Traceback (most recent call last):
+  File "/Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/uagents/communication.py", line 85, in run
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/queues.py", line 160, in get
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py", line 761, in call_soon
+  File "/Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py", line 519, in _check_closed
+RuntimeError: Event loop is closed
+ERROR:asyncio:Task was destroyed but it is pending!
+task: <Task cancelling name='Task-9' coro=<TCPConnector._resolve_host_with_throttle() running at /Users/aryanmudgal/Desktop/ConnectDots/braillemap-agents/venv311/lib/python3.11/site-packages/aiohttp/connector.py:1221> wait_for=<Future cancelled> cb=[set.discard(), shield.<locals>._inner_done_callback() at /Library/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/tasks.py:881]>
