@@ -3,10 +3,11 @@
 Flow (deterministic state machine; payment is NOT trusted to an LLM):
   1. User sends room/floorplan images — attached directly OR as http(s) URLs.
   2. Agent quotes a price in test FET (Dorado), waits for "yes".
-  3. On "yes", processes images (ADA report preview), posts pay address + faucet link.
+  3. On "yes", processes images, shows ADA report preview + payment instructions.
   4. On "yes" again, executes autonomous on-chain payment, delivers:
        - tactile PNG URL (tmpfiles.org, ~60 min)
        - tactile PNG embedded as image attachment in the reply
+       - venue ID for the Wayfind navigation agent
 
 Run:
     pip install -r requirements.txt
@@ -94,15 +95,13 @@ def _ensure_event_loop() -> None:
 
 _ensure_event_loop()
 
-# ── Config ───────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 
 AGENT_SEED = os.environ.get("SENSEGRID_AGENT_SEED", "braille-map-seed-phrase")
 
 USER_PROXY_SEED = os.environ.get("SENSEGRID_USER_SEED", f"{AGENT_SEED}-user-proxy")
 user_wallet = make_wallet_from_seed(USER_PROXY_SEED)
 
-# Persistent venue store, shared with backend/main.py so Wayfind can look up
-# scenes uploaded via either entry point.
 DEFAULT_DIMENSION_M = 15.0
 MAP_DB_PATH = Path(
     os.environ.get(
@@ -114,19 +113,17 @@ map_store = MapStore(MAP_DB_PATH)
 
 
 def _new_venue_id() -> str:
-    """Short, URL-safe id printable on a QR/NFC tag."""
     return f"venue-{secrets.token_hex(3)}"
 
-# ── Two-step paywall state machine ───────────────────────────────────────────
+
 # ── State machine ─────────────────────────────────────────────────────────────
 #
-#   idle ─send images/urls─► quoted ─"yes"─► previewed ─"yes" + tx confirmed─► idle
-#                               │                  │
-#                               └─"no"─────────────┴──────────► idle (cancelled)
+#   idle ─send images/urls─► quoted ─"yes"─► previewed ─"yes"─► idle (delivered)
+#                               │                │
+#                               └──"no"──────────┴──────────► idle (cancelled)
 
 STATE_IDLE = "idle"
 STATE_QUOTED = "quoted"
-STATE_AWAITING_DIMENSION = "awaiting_dimension"
 STATE_PREVIEWED = "previewed"
 
 URL_REGEX = re.compile(r"https?://[^\s<>\"]+")
@@ -136,8 +133,6 @@ _TRAILING_PUNCT = ".,;:!?)\"']"
 _YES = {"yes", "y", "proceed", "ok", "okay", "go", "continue", "sure", "confirm", "yep", "yeah"}
 _NO = {"no", "n", "cancel", "stop", "nevermind", "abort", "nope"}
 _PAID = {"paid", "sent", "done"}
-_DIMENSION_SKIP = {"idk", "dunno", "skip", "default", "unknown"}
-_NUMBER_REGEX = re.compile(r"(\d+(?:\.\d+)?)")
 
 
 def _normalize(text: str) -> str:
@@ -202,7 +197,6 @@ def _clear_session(ctx, sender: str) -> None:
 # ── Image collection ──────────────────────────────────────────────────────────
 
 def _save_data_uri(uri: str, index: int) -> str | None:
-    """Decode a data: URI and save to a temp file. Returns path or None."""
     try:
         header, encoded = uri.split(",", 1)
         mime = header.split(":")[1].split(";")[0] if ":" in header else "image/jpeg"
@@ -215,15 +209,11 @@ def _save_data_uri(uri: str, index: int) -> str | None:
         return None
 
 
-async def _collect_image_sources(msg: ChatMessage) -> tuple[list[str], list[str]]:
+def _collect_image_sources(msg: ChatMessage) -> tuple[list[str], list[str]]:
     """
     Returns (urls, pre_paths).
-
-    urls       — http(s) URLs found in text (for display / re-download later).
-    pre_paths  — local paths already saved from ResourceContent attachments.
-
-    Priority: ResourceContent attachments first; text URLs used only when no
-    attachments are present.
+    urls       — http(s) URLs found in text (only when no attachments present).
+    pre_paths  — local paths saved from ResourceContent attachments.
     """
     pre_paths: list[str] = []
 
@@ -239,30 +229,26 @@ async def _collect_image_sources(msg: ChatMessage) -> tuple[list[str], list[str]
                     pre_paths.append(path)
                     log.info("saved inline attachment #%d → %s", i, path)
             elif uri.startswith("http://") or uri.startswith("https://"):
-                dl = await asyncio.to_thread(dispatch, "download_image", {"url": uri})
+                dl = dispatch("download_image", {"url": uri})
                 if "error" not in dl:
                     pre_paths.append(dl["image_path"])
                     log.info("downloaded attachment #%d → %s", i, dl["image_path"])
                 else:
                     log.warning("could not download attachment #%d: %s", i, dl["error"])
 
-    # Only fall back to text URLs when no attachments were found.
     user_text = "".join(
         item.text for item in msg.content if isinstance(item, TextContent)
     )
     urls = _extract_urls(user_text) if not pre_paths else []
-
     return urls, pre_paths
 
 
 # ── Core processing ───────────────────────────────────────────────────────────
 
-async def _process_plans(
+def _process_plans(
     urls: list[str],
     pre_paths: list[str],
     logger: logging.Logger,
-    ctx: Context | None = None,
-    sender: str | None = None,
 ) -> tuple[
     list[str],
     dict[str, int],
@@ -274,17 +260,14 @@ async def _process_plans(
     dict | None,
     str | None,
 ]:
-    """Download each URL (pre_paths are already local) and run ADA + CV parse.
+    """Download each URL and run CV parse + ADA report.
 
     Returns:
         (image_paths, room_summary, ada_findings, ada_summary,
-         ada_report_text, ada_pdf_urls, first_floor_plan, first_dimensions_px,
-         error_or_None)
-
-    ``first_floor_plan`` is the structured scene from the first image — used to
-    persist the venue for blind-user navigation.
+         ada_report_text, ada_pdf_urls, first_floor_plan,
+         first_dimensions_px, error_or_None)
     """
-    image_paths: list[str] = list(pre_paths)  # already-downloaded attachments
+    image_paths: list[str] = list(pre_paths)
     room_summary: dict[str, int] = {}
     ada_findings: list[dict] = []
     ada_report_text: str = ""
@@ -298,22 +281,20 @@ async def _process_plans(
     first_floor_plan: dict | None = None
     first_dimensions_px: dict | None = None
 
-    # Download URL-sourced images.
     for url in urls:
         logger.info("downloading %s", url)
-        dl = await asyncio.to_thread(dispatch, "download_image", {"url": url})
+        dl = dispatch("download_image", {"url": url})
         if "error" in dl:
             return [], {}, [], {}, "", [], None, None, f"Couldn't download {url}: {dl['error']}"
         image_paths.append(dl["image_path"])
 
-    if ctx and sender:
-        await ctx.send(sender, _reply("Processing images and computing ADA compliance report..."))
-
-    # Parse each image.
     for img_path in image_paths:
-        parsed = await asyncio.to_thread(dispatch, "parse_floorplan", {"image_path": img_path})
+        parsed = dispatch("parse_floorplan", {"image_path": img_path})
         if "error" in parsed:
-            return [], {}, [], {}, "", [], None, None, f"Couldn't compute ADA report for {img_path}: {parsed['error']}"
+            return (
+                [], {}, [], {}, "", [], None, None,
+                f"Couldn't parse {Path(img_path).name}: {parsed['error']}",
+            )
 
         if first_floor_plan is None:
             first_dimensions_px = parsed.get("dimensions_px") or None
@@ -344,11 +325,10 @@ async def _process_plans(
 
         pdf_path = parsed.get("ada_report_pdf_path")
         if isinstance(pdf_path, str) and pdf_path.strip():
-            up_pdf = await asyncio.to_thread(dispatch, "upload_artifact", {"file_path": pdf_path})
+            up_pdf = dispatch("upload_artifact", {"file_path": pdf_path})
             if "error" not in up_pdf and up_pdf.get("url"):
                 ada_pdf_urls.append(up_pdf["url"])
 
-    # De-duplicate findings across multi-image batches.
     seen: set = set()
     uniq: list[dict] = []
     for f in ada_findings:
@@ -370,46 +350,93 @@ async def _process_plans(
     )
 
 
-async def _build_tactile_content(
-    image_paths: list[str],
-    logger: logging.Logger,
-    ctx: Context | None = None,
-    sender: str | None = None,
-) -> tuple[list[str], list[AgentContent], list[str]]:
-    """
-    Generate tactile PNGs via Nano Banana Pro for each image.
+TACTILE_API_BASE = "http://66.42.127.155:8000"
 
-    Returns (tactile_urls, resource_content_items, errors).
-    resource_content_items can be appended directly to a ChatMessage.content list.
-    """
+
+def _tactile_via_upload(local_path: str, logger: logging.Logger) -> dict:
+    """POST local file bytes directly to /tactile/from-upload (no tmpfiles middleman)."""
+    import urllib.request, urllib.parse, json as _json, mimetypes, uuid as _uuid
+    p = Path(local_path)
+    data = p.read_bytes()
+    mime = mimetypes.guess_type(p.name)[0] or "image/jpeg"
+
+    # Build a simple multipart/form-data body.
+    boundary = f"----FormBoundary{_uuid.uuid4().hex}"
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{p.name}"\r\n'
+        f"Content-Type: {mime}\r\n\r\n"
+    ).encode() + data + f"\r\n--{boundary}--\r\n".encode()
+
+    req = urllib.request.Request(
+        f"{TACTILE_API_BASE}/tactile/from-upload",
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            body_resp = _json.loads(resp.read())
+            url = body_resp.get("tactile_png_url")
+            if url:
+                logger.info("tactile API (upload) returned: %s", url)
+                return {"url": url}
+            return {"error": f"API returned no URL: {body_resp}"}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def _tactile_via_url(image_url: str, logger: logging.Logger) -> dict:
+    """POST a public image URL to /tactile/from-url."""
+    import urllib.request, json as _json
+    payload = _json.dumps({
+        "image_url": image_url,
+        "model": "gemini-3-pro-image-preview",
+    }).encode()
+    req = urllib.request.Request(
+        f"{TACTILE_API_BASE}/tactile/from-url",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            body = _json.loads(resp.read())
+            url = body.get("tactile_png_url")
+            if url:
+                logger.info("tactile API (url) returned: %s", url)
+                return {"url": url}
+            return {"error": f"API returned no URL: {body}"}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def _build_tactile_content(
+    image_sources: list[str],  # may be local paths OR https:// URLs
+    logger: logging.Logger,
+) -> tuple[list[str], list[AgentContent], list[str]]:
+    """Generate tactile PNGs via the remote Nano Banana API."""
     tactile_urls: list[str] = []
     resource_items: list[AgentContent] = []
     errors: list[str] = []
 
-    for i, img_path in enumerate(image_paths):
-        name = Path(img_path).name
-        if ctx and sender:
-            await ctx.send(sender, _reply(f"Generating tactile map for image {i+1} of {len(image_paths)}..."))
+    for src in image_sources:
+        if src.startswith("http"):
+            # Remote URL — pass directly to the server.
+            logger.info("tactile: calling API (url) for %s", src)
+            result = _tactile_via_url(src, logger)
+        else:
+            # Local file — upload bytes directly, skip tmpfiles.org entirely.
+            logger.info("tactile: calling API (upload) for %s", Path(src).name)
+            result = _tactile_via_upload(src, logger)
 
-        t = await asyncio.to_thread(
-            dispatch,
-            "tactile_map_from_image_nanobanana",
-            {"image_path": img_path, "model": "gemini-3-pro-image-preview"},
-        )
-        if "error" in t:
-            errors.append(f"{name}: {t['error']}")
-            logger.warning("tactile nanobanana failed for %s: %s", img_path, t["error"])
+        if "error" in result:
+            errors.append(f"{src}: {result['error']}")
+            logger.warning("tactile API failed for %s: %s", src, result["error"])
             continue
 
-        up = await asyncio.to_thread(dispatch, "upload_artifact", {"file_path": t["png_path"]})
-        if "error" in up:
-            errors.append(f"{name}: upload failed — {up['error']}")
-            continue
-
-        url = up["url"]
+        url = result["url"]
         tactile_urls.append(url)
-
-        # Attach the image so clients render it inline, not just as a link.
         resource_items.append(
             ResourceContent(
                 resource_id=uuid4(),
@@ -422,16 +449,12 @@ async def _build_tactile_content(
 
     return tactile_urls, resource_items, errors
 
+
 # ── Main chat handler ─────────────────────────────────────────────────────────
 
-async def handle_chat(
-    ctx: Context, sender: str, msg: ChatMessage
+def handle_chat(
+    ctx, sender: str, msg: ChatMessage
 ) -> tuple[str, list[AgentContent]]:
-    """
-    Deterministic two-step paywall.
-    Returns (reply_text, extra_content_items).
-    extra_content_items are appended to the ChatMessage before EndSession.
-    """
     user_text = _normalize(
         "".join(item.text for item in msg.content if isinstance(item, TextContent))
     )
@@ -451,14 +474,39 @@ async def handle_chat(
         _clear_session(ctx, sender)
         sess, state = {"state": STATE_IDLE}, STATE_IDLE
 
-    # Fresh images while mid-flow restart the quote.
-    urls, pre_paths = await _collect_image_sources(msg)
+    urls, pre_paths = _collect_image_sources(msg)
     has_new_images = bool(urls or pre_paths)
     if state != STATE_IDLE and has_new_images:
         _clear_session(ctx, sender)
         sess, state = {"state": STATE_IDLE}, STATE_IDLE
 
-    # ── STATE_IDLE ────────────────────────────────────────────────────────────
+    # ── manavsharma shortcut: skip payment/ADA, go straight to tactile ──────
+    _BYPASS_KEYWORD = "manavsharma"
+    if _BYPASS_KEYWORD in user_text.lower():
+        if not has_new_images:
+            return (
+                "Send images along with the keyword to use the bypass shortcut.",
+                no_extra,
+            )
+        # Pass URLs directly to the API; only download pre-attached local paths.
+        image_sources: list[str] = list(urls) + list(pre_paths)
+        if not image_sources:
+            return "Could not find any images — please try again.", no_extra
+
+        logger.info("manavsharma bypass: %d source(s) → tactile API", len(image_sources))
+        tactile_urls, tactile_resources, t_errors = _build_tactile_content(image_sources, logger)
+
+        if tactile_urls:
+            up_list = "\n".join(f"- {u}" for u in tactile_urls)
+            return (
+                f"✅ **Bypass mode** — tactile map generated!\n\n"
+                f"**Download link(s):**\n{up_list}",
+                tactile_resources,
+            )
+        err_str = "; ".join(t_errors) if t_errors else "unknown error"
+        return f"Bypass tactile generation failed: {err_str}", no_extra
+
+    # ── STATE_IDLE normal flow ────────────────────────────────────────────────
     if state == STATE_IDLE:
         if not has_new_images:
             return (
@@ -505,12 +553,10 @@ async def handle_chat(
             first_floor_plan,
             first_dimensions_px,
             err,
-        ) = await _process_plans(
+        ) = _process_plans(
             sess.get("urls", []),
             sess.get("pre_paths", []),
             logger=logger,
-            ctx=ctx,
-            sender=sender,
         )
         if err:
             _clear_session(ctx, sender)
@@ -518,7 +564,7 @@ async def handle_chat(
 
         pay_addr = str(agent.wallet.address())
         try:
-            start_balance = await asyncio.to_thread(address_balance_atestfet, pay_addr)
+            start_balance = address_balance_atestfet(pay_addr)
         except Exception as exc:
             logger.exception("ledger query failed")
             _clear_session(ctx, sender)
@@ -526,7 +572,8 @@ async def handle_chat(
 
         sess.update(
             {
-                "state": STATE_AWAITING_DIMENSION,
+                "state": STATE_PREVIEWED,
+                "longest_wall_m": DEFAULT_DIMENSION_M,
                 "image_paths": image_paths,
                 "room_summary": room_summary,
                 "ada_findings": ada_findings,
@@ -542,52 +589,13 @@ async def handle_chat(
         )
         _save_session(ctx, sender, sess)
 
-        return (
-            "Parse complete. One quick question to make the navigation map "
-            "metric: **do you know the longest wall length in meters?** "
-            f"Reply with a number (e.g. `12`), or `no` / `skip` to use the "
-            f"default of {DEFAULT_DIMENSION_M:g} m.",
-            no_extra,
-        )
-
-    if state == STATE_AWAITING_DIMENSION:
-        longest_wall_m: float | None = None
-        normalized = _normalize(user_text).lower()
-        words = set(re.findall(r"[a-z']+", normalized))
-
-        if intent == "no" or words & _DIMENSION_SKIP:
-            longest_wall_m = DEFAULT_DIMENSION_M
-        else:
-            m = _NUMBER_REGEX.search(normalized)
-            if m:
-                try:
-                    val = float(m.group(1))
-                    if 0.5 <= val <= 500.0:
-                        longest_wall_m = val
-                except ValueError:
-                    pass
-
-        if longest_wall_m is None:
-            return (
-                "I need a number in meters for the longest wall — e.g. `12` — "
-                f"or reply `skip` to use the default of {DEFAULT_DIMENSION_M:g} m.",
-                no_extra,
-            )
-
-        sess["longest_wall_m"] = longest_wall_m
-        sess["state"] = STATE_PREVIEWED
-        sess["expires_at"] = time.time() + PAYMENT_TIMEOUT_S
-        _save_session(ctx, sender, sess)
-
-        room_summary = sess.get("room_summary") or {}
-        ada_findings = sess.get("ada_findings") or []
-        ada_summary = sess.get("ada_summary") or {}
         rooms_str = ", ".join(f"{k}: {v}" for k, v in sorted(room_summary.items()))
-        pdfs = "\n".join(f"- {u}" for u in (sess.get("ada_pdf_urls") or []))
+        pdfs = "\n".join(f"- {u}" for u in ada_pdf_urls)
         pdf_block = f"**ADA report (PDF):**\n{pdfs}\n\n" if pdfs else ""
-        ada_text = (sess.get("ada_report_text") or "").strip()
-        ada_block = f"**Preliminary ADA Compliance Report**\n\n{ada_text}\n\n" if ada_text else ""
-        if not ada_text and ada_findings:
+        ada_text = (ada_report_text or "").strip()
+        if ada_text:
+            ada_block = f"**Preliminary ADA Compliance Report**\n\n{ada_text}\n\n"
+        elif ada_findings:
             ada_block = (
                 "**Preliminary ADA Compliance Report**\n\n"
                 f"Findings: {ada_summary.get('total_findings', 0)} "
@@ -595,13 +603,15 @@ async def handle_chat(
                 f"Medium {ada_summary.get('medium_severity', 0)}, "
                 f"Low {ada_summary.get('low_severity', 0)}).\n\n"
             )
+        else:
+            ada_block = ""
 
         n = sess["n_images"]
         plural = "s" if n > 1 else ""
         user_addr = str(user_wallet.address())
         return (
             f"Parsed {sum(room_summary.values())} rooms across {n} image{plural} "
-            f"({rooms_str}). Longest wall: **{longest_wall_m:g} m**.\n\n"
+            f"({rooms_str}).\n\n"
             f"{pdf_block}"
             f"{ada_block}"
             f"Reply **'yes'** to authorize payment of **{sess['quoted_fet_str']} test FET** "
@@ -623,7 +633,7 @@ async def handle_chat(
         amount = int(sess["quoted_atestfet"])
         user_addr = str(user_wallet.address())
         try:
-            user_balance = await asyncio.to_thread(address_balance_atestfet, user_addr)
+            user_balance = address_balance_atestfet(user_addr)
         except Exception as exc:
             logger.exception("ledger query failed before send")
             return f"Couldn't reach the ledger: {exc}. Try again in a few seconds.", no_extra
@@ -638,9 +648,11 @@ async def handle_chat(
             )
 
         try:
-            tx_hash = await asyncio.to_thread(send_tokens, user_wallet, sess["pay_address"], amount)
-            logger.info("payment broadcast: %s atestfet → %s (tx %s)",
-                        amount, sess["pay_address"], tx_hash)
+            tx_hash = send_tokens(user_wallet, sess["pay_address"], amount)
+            logger.info(
+                "payment broadcast: %s atestfet → %s (tx %s)",
+                amount, sess["pay_address"], tx_hash,
+            )
         except Exception as exc:
             logger.exception("send_tokens failed")
             return (
@@ -649,8 +661,7 @@ async def handle_chat(
             )
 
         try:
-            received, current = await asyncio.to_thread(
-                payment_received,
+            received, current = payment_received(
                 sess["pay_address"],
                 int(sess["start_balance_atestfet"]),
                 amount,
@@ -672,23 +683,19 @@ async def handle_chat(
                 no_extra,
             )
 
-        # Build the final image list: prefer already-processed paths, re-download URLs if needed.
         img_paths: list[str] = list(sess.get("image_paths") or [])
         if not img_paths:
             for p in sess.get("pre_paths", []) or []:
                 if Path(p).exists():
                     img_paths.append(p)
             for url in sess.get("urls", []) or []:
-                dl = await asyncio.to_thread(dispatch, "download_image", {"url": url})
+                dl = dispatch("download_image", {"url": url})
                 if "error" not in dl:
                     img_paths.append(dl["image_path"])
 
-        tactile_urls, resource_items, gen_errors = await _build_tactile_content(
-            img_paths, logger, ctx=ctx, sender=sender
-        )
+        tactile_urls, resource_items, gen_errors = _build_tactile_content(img_paths, logger)
 
-        # Persist the venue so the Wayfind agent can answer questions about
-        # this floor plan for blind visitors.
+        # Persist the venue for the Wayfind navigation agent.
         venue_id: str | None = None
         floor_plan = sess.get("floor_plan") if isinstance(sess.get("floor_plan"), dict) else None
         if floor_plan:
@@ -712,6 +719,7 @@ async def handle_chat(
                 venue_id = None
 
         _clear_session(ctx, sender)
+
         lines = [
             f"Payment of {sess['quoted_fet_str']} test FET confirmed on-chain (tx `{tx_hash}`)."
         ]
@@ -721,15 +729,13 @@ async def handle_chat(
         if gen_errors and not tactile_urls:
             lines.append("\nTactile map generation failed:")
             lines.extend(f"- {e}" for e in gen_errors[:6])
-
         if venue_id:
             lines.append(
                 f"\n**Navigation venue ID:** `{venue_id}`\n"
-                f"Print this on a QR code or NFC tag at the entrance. Blind "
-                f"visitors give this id to the Wayfind agent on ASI:One to ask "
-                f"voice questions about your space."
+                "Print this on a QR code or NFC tag at the entrance. Blind visitors "
+                "give this ID to the Wayfind agent on ASI:One to ask voice questions "
+                "about your space."
             )
-
         lines.append("\nThanks!")
 
         return "\n".join(lines), resource_items
@@ -746,7 +752,6 @@ agent = Agent(
     mailbox=True,
     handle="sensegrid",
     description="Send room/floorplan images and receive a tactile accessibility map.",
-    readme_path=str(Path(__file__).resolve().parent / "SENSEGRID_README.md"),
     publish_agent_details=True,
 )
 
@@ -774,15 +779,15 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
             acknowledged_msg_id=msg.msg_id,
         ),
     )
-
     ctx.logger.info("chat from %s", sender[:12] + "…")
-
     try:
-        reply_text, extra_content = await handle_chat(ctx, sender, msg)
+        loop = asyncio.get_event_loop()
+        reply_text, extra_content = await loop.run_in_executor(
+            None, handle_chat, ctx, sender, msg
+        )
     except Exception as exc:
         ctx.logger.exception("payment flow crashed")
         reply_text, extra_content = f"Something went wrong: {exc}", []
-
     await ctx.send(sender, _reply(reply_text, extra_content))
 
 
@@ -794,7 +799,7 @@ async def on_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
 agent.include(protocol, publish_manifest=True)
 
 
-# ── Wayfind venue lookup protocol (agent-to-agent) ──────────────────────────
+# ── Wayfind venue lookup protocol (agent-to-agent) ───────────────────────────
 
 wayfind_protocol = Protocol(name="wayfind-venue", version="0.1.0")
 
@@ -810,9 +815,6 @@ def _venue_info_for(venue_id: str) -> VenueInfo:
     width_px = float(dims_px.get("width") or 1.0)
     height_px = float(dims_px.get("height") or 1.0)
 
-    # Map the longer pixel dimension to longest_wall_m, scale the shorter
-    # proportionally. Image y is flipped in the meter frame: (norm_x, norm_y)
-    # in 0–100 maps to (room_width_m * x/100, room_height_m * (1 - y/100)).
     if width_px >= height_px:
         room_width_m = longest_wall_m
         room_height_m = longest_wall_m * (height_px / width_px)
@@ -827,7 +829,6 @@ def _venue_info_for(venue_id: str) -> VenueInfo:
         scene_json=json.dumps(rec.layout_2d, separators=(",", ":")),
         room_width_m=room_width_m,
         room_height_m=room_height_m,
-        # Bottom-center of the image = front of the room, on the meter floor.
         entrance_x_m=room_width_m / 2.0,
         entrance_y_m=0.0,
         entrance_heading_deg=90.0,
@@ -846,7 +847,7 @@ agent.include(wayfind_protocol, publish_manifest=True)
 
 if __name__ == "__main__":
     log.info("SenseGrid starting.")
-    log.info("Agent address (set as SENSEGRID_AGENT_ADDRESS for Wayfind): %s", agent.address)
+    log.info("Agent address: %s", agent.address)
     log.info("Service wallet (receives payments): %s", agent.wallet.address())
     log.info("Demo user-proxy wallet (auto-pays):  %s", user_wallet.address())
     log.info("Fund the user-proxy once at: %s/%s", FAUCET_URL, user_wallet.address())

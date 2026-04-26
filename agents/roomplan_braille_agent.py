@@ -413,7 +413,10 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
     )
     ctx.logger.info("chat from %s", sender[:16] + "…")
     try:
-        reply_text, extra_content = handle_chat(ctx, sender, msg)
+        loop = asyncio.get_event_loop()
+        reply_text, extra_content = await loop.run_in_executor(
+            None, handle_chat, ctx, sender, msg
+        )
     except Exception as exc:
         ctx.logger.exception("handle_chat crashed")
         reply_text, extra_content = f"Something went wrong: {exc}", []

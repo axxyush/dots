@@ -61,32 +61,28 @@ ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 _NANOBANANA_TACTILE_PROMPT = """
 You are generating an accessibility tactile map for blind/low-vision users.
 
-INPUT: a floorplan image.
-OUTPUT: a single high-contrast raster image representing a tactile plaque-style map.
+INPUT: a RoomPlan / floorplan image.
+OUTPUT: a single high-contrast raster image representing a tactile map.
 
 Hard requirements:
 - Produce a CLEAN 2D DIAGRAM (orthographic top-down). No perspective, no 3D, no camera angle.
 - White background with ONLY black marks. No colors, no gray, no gradients, no shadows.
 - Do NOT "stylize" into a plaque with dark background. This must look like a printable diagram.
 - Everything must fit inside the canvas with a ~5% margin. Do not draw or place text outside the border.
-- This is a tactile map, not a Braille-only map. You do NOT need to replicate every room boundary using dots.
-- You MAY use both raised lines and tactile textures:
-  - walls/boundaries: thick solid lines (continuous)
+- You do NOT need to exactly replicate every room boundary using dots. Prioritize usability.
+- You MAY use raised lines + tactile textures:
+  - walls/boundaries: thick solid lines
   - corridors: dotted/stipple texture
   - room areas: sparse dot texture
   - special areas (restroom/courtyard/etc): distinct hatch/wave pattern
-  - icons/markers: simple line icons are allowed
+  - icons: simple line icons are allowed
 - Preserve topology: rooms, walls, doors, and corridors must stay in correct relative position.
 - Add clear door gaps. Mark the main entrance with a clear star marker.
-- Do NOT include numeric labels (no digits 0-9) and do NOT include a numbered legend.
-- Prefer an unnumbered legend that uses distinct patterns/symbols only (e.g., hatch = seating, dots = concourse, thick line = wall).
+- Add numbered markers for key rooms/objects, and include an embedded legend panel (right side or bottom-right):
+  - show visual legend + Braille under each legend label if possible
+  - legend must map numbers/patterns/icons → labels
 - No decorative elements, no extra branding. Text should be minimal and aligned.
-- Printable and legible at A4 size.
-- BILINGUAL LABELS — MANDATORY: every English text label that appears on the map MUST have its
-  Grade-1 Braille translation printed directly below it (same font size as the dots in the reference).
-  This applies to ALL labels: room names, area names, legend entries, and any other text.
-  Never leave an English word on the map without its Braille equivalent directly beneath it.
-  The Braille dots must be clearly rendered and large enough to be readable on an A4 print.
+- The map should be printable and still legible at A4 size.
 
 If the source image is cluttered, simplify while preserving navigation-critical structure.
 """.strip()
@@ -282,6 +278,33 @@ def qa_context_from_tactile_image_gemini(image_path: str, model: str = "gemini-2
     return {"context_text": text, "model": model}
 
 
+def gemini_chat(prompt: str, user_text: str, model: str = "gemini-2.5-pro") -> dict:
+    """Conversational wrapper for Gemini."""
+    if not os.environ.get("GEMINI_API_KEY"):
+        return {"error": "GEMINI_API_KEY not set"}
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    try:
+        resp = client.models.generate_content(
+            model=model,
+            contents=[prompt, user_text],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.0,
+            ),
+        )
+        from cv_gemini_refine import _extract_json  # noqa: WPS433
+
+        data = _extract_json(resp.text)
+        if not data:
+            return {"error": f"Gemini returned non-JSON: {resp.text}"}
+        return data
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
 def qa_context_from_floorplan_image_gemini(image_path: str, model: str = "gemini-2.5-pro") -> dict:
     """Create a compact Q&A context blob from a floorplan image (Gemini vision)."""
     p = Path(image_path)
@@ -355,8 +378,54 @@ def qa_context_from_floorplan_image_gemini(image_path: str, model: str = "gemini
     return {"context_text": text, "model": model}
 
 
+def _prep_image_for_gemini(p: Path) -> tuple[bytes, str]:
+    """Return (img_bytes, mime_type) ready for Gemini image generation.
+
+    Applies two fixes that prevent Gemini from hanging:
+      1. RGBA / palette images → flatten to RGB on white (Gemini stalls on alpha).
+      2. Images smaller than 1024 px on the long side → upscale to 1024 px
+         (the image-generation model produces garbage / hangs on tiny inputs).
+    Max side is capped at 2048 px to keep latency reasonable.
+    """
+    from PIL import Image  # type: ignore
+    from io import BytesIO
+
+    img = Image.open(p)
+
+    if img.mode in ("RGBA", "LA", "P"):
+        background = Image.new("RGB", img.size, (255, 255, 255))
+        if img.mode == "P":
+            img = img.convert("RGBA")
+        background.paste(img, mask=img.split()[-1] if img.mode in ("RGBA", "LA") else None)
+        img = background
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
+
+    w, h = img.size
+    long_side = max(w, h)
+    if long_side < 1024:
+        scale = 1024 / long_side
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    elif long_side > 2048:
+        scale = 2048 / long_side
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue(), "image/png"
+
+
 def tactile_map_from_image_nanobanana(image_path: str, model: str = "gemini-3-pro-image-preview") -> dict:
-    """Generate a tactile-map PNG directly from the input image (Nano Banana Pro)."""
+    """Generate a tactile-map PNG from an input floorplan image.
+
+    Robust pipeline:
+      1. Resize input to ≤1024 px (long side) — prevents Gemini 504 DEADLINE_EXCEEDED.
+      2. Flatten RGBA/P → RGB, always send as PNG.
+      3. Retry up to 3× on transient server errors (504, 429, 500).
+    """
+    import time as _time
+    from io import BytesIO
+
     p = Path(image_path)
     if not p.exists():
         return {"error": f"image not found: {image_path}"}
@@ -368,49 +437,88 @@ def tactile_map_from_image_nanobanana(image_path: str, model: str = "gemini-3-pr
     try:
         from google import genai  # type: ignore
         from google.genai import types  # type: ignore
+        from PIL import Image  # type: ignore
     except Exception as exc:
-        return {"error": f"google-genai not available: {exc}"}
+        return {"error": f"dependency not available: {exc}"}
 
+    # ── Step 1: prep image ────────────────────────────────────────────────
     try:
-        img_bytes = p.read_bytes()
-        mime = "image/png" if p.suffix.lower() == ".png" else "image/jpeg"
-        img_part = types.Part.from_bytes(data=img_bytes, mime_type=mime)
-        client = genai.Client(api_key=api_key)
-        # Match the local test script behavior: don't force aspect/size unless needed.
-        cfg = types.GenerateContentConfig(
-            response_modalities=["TEXT", "IMAGE"],
-            temperature=0.0,
-        )
-        resp = client.models.generate_content(
-            model=model,
-            contents=[
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part(text=_NANOBANANA_TACTILE_PROMPT),
-                        img_part,
-                    ],
-                )
-            ],
-            config=cfg,
-        )
-    except Exception as exc:
-        return {"error": f"generation failed: {exc}"}
+        img = Image.open(p)
+        # Flatten alpha / palette → RGB
+        if img.mode in ("RGBA", "LA", "P"):
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            if img.mode == "P":
+                img = img.convert("RGBA")
+            bg.paste(img, mask=img.split()[-1] if img.mode in ("RGBA", "LA") else None)
+            img = bg
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
 
+        # Resize to max 1024 px — keeps the API fast and avoids timeouts.
+        w, h = img.size
+        long_side = max(w, h)
+        MAX_PX = 1024
+        if long_side > MAX_PX:
+            scale = MAX_PX / long_side
+            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        img_bytes = buf.getvalue()
+    except Exception as exc:
+        return {"error": f"image prep failed: {exc}"}
+
+    log.info("tactile nanobanana: prepped %s → %d bytes, sending to %s", p.name, len(img_bytes), model)
+
+    # ── Step 2: call Gemini with retries ──────────────────────────────────
+    client = genai.Client(api_key=api_key)
+    cfg = types.GenerateContentConfig(
+        response_modalities=["TEXT", "IMAGE"],
+        temperature=0.0,
+    )
+    img_part = types.Part.from_bytes(data=img_bytes, mime_type="image/png")
+    contents = [
+        types.Content(
+            role="user",
+            parts=[types.Part(text=_NANOBANANA_TACTILE_PROMPT), img_part],
+        )
+    ]
+
+    MAX_RETRIES = 3
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = client.models.generate_content(model=model, contents=contents, config=cfg)
+            last_error = None
+            break  # success
+        except Exception as exc:
+            last_error = exc
+            err_str = str(exc)
+            # Retry on transient server errors only.
+            if any(code in err_str for code in ("504", "429", "500", "DEADLINE_EXCEEDED", "RESOURCE_EXHAUSTED")):
+                wait = 5 * attempt
+                log.warning("tactile attempt %d/%d failed (%s), retrying in %ds…", attempt, MAX_RETRIES, err_str[:80], wait)
+                _time.sleep(wait)
+            else:
+                return {"error": f"generation failed: {exc}"}
+
+    if last_error is not None:
+        return {"error": f"generation failed after {MAX_RETRIES} attempts: {last_error}"}
+
+    # ── Step 3: extract the output image ──────────────────────────────────
     out_path = ARTIFACT_DIR / (p.stem + "_tactile_nanobanana.png")
 
-    # Find first image part.
-    parts = getattr(resp, "parts", None) or []
-    for part in parts:
+    # Search response parts for an image.
+    for part in getattr(resp, "parts", []) or []:
         if getattr(part, "inline_data", None) is not None:
             try:
-                img = part.as_image()
-                img.save(out_path)
+                part.as_image().save(out_path)
+                log.info("tactile nanobanana: saved %s", out_path)
                 return {"png_path": str(out_path), "model": model}
             except Exception as exc:
                 return {"error": f"could not save output image: {exc}"}
 
-    # Fallback: search candidates if needed.
+    # Fallback: search inside candidates.
     for cand in getattr(resp, "candidates", []) or []:
         content = getattr(cand, "content", None)
         if not content:
@@ -418,20 +526,18 @@ def tactile_map_from_image_nanobanana(image_path: str, model: str = "gemini-3-pr
         for part in getattr(content, "parts", []) or []:
             if getattr(part, "inline_data", None) is not None:
                 try:
-                    img = part.as_image()
-                    img.save(out_path)
+                    part.as_image().save(out_path)
+                    log.info("tactile nanobanana: saved %s (from candidate)", out_path)
                     return {"png_path": str(out_path), "model": model}
                 except Exception as exc:
                     return {"error": f"could not save output image: {exc}"}
 
-    # No image returned.
-    text = ""
-    for part in parts:
-        if getattr(part, "text", None):
-            text += part.text + "\n"
-    debug_path = ARTIFACT_DIR / (p.stem + "_tactile_nanobanana.txt")
+    # No image in response — dump debug text.
+    text = "".join(part.text + "\n" for part in (getattr(resp, "parts", []) or []) if getattr(part, "text", None))
+    debug_path = ARTIFACT_DIR / (p.stem + "_tactile_nanobanana_debug.txt")
     debug_path.write_text(text or "(no image returned)", encoding="utf-8")
     return {"error": f"model returned no image (see {debug_path})"}
+
 
 
 def tactile_map_from_images_nanobanana(
@@ -487,14 +593,15 @@ def tactile_map_from_images_nanobanana(
                     mime_type=_mime_from_url(src),
                 ))
             else:
-                # Local file path (e.g. decoded data: URI saved to temp).
+                # Local file path — preprocess (RGBA→RGB, resize) before sending.
                 p = Path(src)
                 if not p.exists():
                     log.warning("skipping missing file: %s", src)
                     continue
+                prepped_bytes, prepped_mime = _prep_image_for_gemini(p)
                 parts.append(types.Part.from_bytes(
-                    data=p.read_bytes(),
-                    mime_type=_mime_from_path(p),
+                    data=prepped_bytes,
+                    mime_type=prepped_mime,
                 ))
 
         if len(parts) == 1:  # only the prompt, no images survived
@@ -596,9 +703,21 @@ def parse_floorplan(image_path: str) -> dict:
         extract_rooms_cv_multiscale = _ex
         regions_to_floor_objects = _r2o
 
+    # Handle HEIC/HEIF on MacOS via sips (iPhone uploads)
+    if p.suffix.lower() in {".heic", ".heif"} and sys.platform == "darwin":
+        log.info("detect HEIC/HEIF format; converting to JPEG via sips: %s", p.name)
+        jpg_path = p.with_suffix(".jpg")
+        import subprocess
+        try:
+            subprocess.run(["sips", "-s", "format", "jpeg", str(p), "--out", str(jpg_path)],
+                           check=True, capture_output=True)
+            p = jpg_path
+        except Exception as exc:
+            log.warning("sips conversion failed for %s: %s", image_path, exc)
+
     img = cv2.imread(str(p), cv2.IMREAD_COLOR)
     if img is None:
-        return {"error": f"could not read image: {image_path}"}
+        return {"error": f"could not read image: {image_path} (format may be unsupported or corrupted)"}
     h, w = img.shape[:2]
 
     regions, _ = extract_rooms_cv_multiscale(img)
@@ -968,6 +1087,25 @@ TOOL_SPECS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "gemini_chat",
+            "description": (
+                "Call Gemini 2.5 Pro to interpret user intent and generate a natural language response. "
+                "Takes a system instructions prompt and the raw user message. "
+                "Returns JSON with 'intent' and 'response'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "System instructions including state/context."},
+                    "user_text": {"type": "string", "description": "Raw text from the user."},
+                },
+                "required": ["prompt", "user_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "upload_artifact",
             "description": (
                 "Upload a local file (PNG/JSON) to a public no-auth host and return "
@@ -995,6 +1133,7 @@ _DISPATCH = {
     "qa_context_from_floorplan_image_gemini": qa_context_from_floorplan_image_gemini,
     "qa_context_from_tactile_image_gemini": qa_context_from_tactile_image_gemini,
     "upload_artifact": upload_artifact,
+    "gemini_chat": gemini_chat,
 }
 
 
