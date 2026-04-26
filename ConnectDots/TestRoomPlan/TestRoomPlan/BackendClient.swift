@@ -5,7 +5,7 @@ import UIKit
 //   Mock (local Mac):  "http://192.168.x.x:8000"  (find IP via System Settings → Wi-Fi → Details)
 //   ngrok tunnel:      "https://abc123.ngrok-free.app"
 //   Production Vultr:  "https://your-server-ip:8000"
-private let kBaseURL = "https://8fc2-184-169-46-4.ngrok-free.app"
+private let kBaseURL = "https://fea6-164-67-70-230.ngrok-free.app"
 
 // TODO: Update with your React dashboard URL
 private let kDashboardURL = "https://YOUR_DASHBOARD_URL_HERE"
@@ -15,10 +15,12 @@ private let kDashboardURL = "https://YOUR_DASHBOARD_URL_HERE"
 struct UploadResponse: Decodable {
     let roomId: String
     let status: String
+    let accessCode: String?
 
     enum CodingKeys: String, CodingKey {
         case roomId = "room_id"
         case status
+        case accessCode = "access_code"
     }
 }
 
@@ -59,6 +61,7 @@ struct RoomsListResponse: Decodable {
 struct RoomStatus: Decodable {
     let roomId: String
     let status: String
+    let accessCode: String?
     let pdfUrl: String?
     let audioUrl: String?
     let narrationText: String?
@@ -73,6 +76,7 @@ struct RoomStatus: Decodable {
     enum CodingKeys: String, CodingKey {
         case roomId = "room_id"
         case status
+        case accessCode = "access_code"
         case pdfUrl = "pdf_url"
         case audioUrl = "audio_url"
         case narrationText = "narration_text"
@@ -266,14 +270,23 @@ final class BackendClient {
     ) async throws -> UploadResponse {
         let url = try baseURL.appendingPathComponent("floorplan")
 
-        // Compress to JPEG and base64 encode
-        guard let jpegData = image.jpegData(compressionQuality: 0.8) else {
+        // Prefer PNG to preserve crisp linework in floor plans.
+        let imageData: Data
+        let mimeType: String
+        if let pngData = image.pngData() {
+            imageData = pngData
+            mimeType = "image/png"
+        } else if let jpegData = image.jpegData(compressionQuality: 0.9) {
+            imageData = jpegData
+            mimeType = "image/jpeg"
+        } else {
             throw BackendError.networkError(
                 NSError(domain: "BackendClient", code: -1,
-                        userInfo: [NSLocalizedDescriptionKey: "Failed to compress floor plan image"])
+                        userInfo: [NSLocalizedDescriptionKey: "Failed to encode floor plan image"])
             )
         }
-        let imageBase64 = jpegData.base64EncodedString()
+
+        let imageBase64 = "data:\(mimeType);base64," + imageData.base64EncodedString()
 
         let payload: [String: Any] = [
             "image_base64": imageBase64,
@@ -369,8 +382,10 @@ final class BackendClient {
     // MARK: Helpers
 
     private func perform(_ request: URLRequest) async throws -> (Data, URLResponse) {
+        var mutableRequest = request
+        mutableRequest.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
         do {
-            return try await URLSession.shared.data(for: request)
+            return try await URLSession.shared.data(for: mutableRequest)
         } catch {
             throw BackendError.networkError(error)
         }

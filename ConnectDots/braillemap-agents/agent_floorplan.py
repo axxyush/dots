@@ -4,8 +4,9 @@ Receives a FloorPlanAnalysisRequest, fetches the floor plan image from the
 backend, sends it to Gemini Vision to extract spatial layout data, and produces
 the standard `layout_2d` format.
 
-Then, it directly triggers Agent 3 (Map) and Agent 4 (Narration) to complete
-the pipeline.
+For floor plans, tactile generation is delegated to the hosted backend via a
+publicly reachable floorplan URL, which can be served through ngrok by the
+local mock backend. ADA recommendations are disabled in this pipeline.
 """
 
 from __future__ import annotations
@@ -14,11 +15,17 @@ import base64
 import json
 import os
 import re
-from datetime import datetime, timezone
+import tempfile
 from io import BytesIO
 from typing import Any, Dict, Optional
 
 import requests
+import asyncio
+try:
+    asyncio.get_event_loop()
+except Exception:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 from dotenv import load_dotenv
 from google import genai
 from PIL import Image
@@ -28,20 +35,22 @@ from schemas import (
     FloorPlanAnalysisRequest,
     MapGenerationRequest,
     NarrationRequest,
-    RecommendationsRequest,
     address_from_seed,
 )
 
-load_dotenv()
+load_dotenv(override=True)
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-pro-image-preview")
+DEPLOYED_BACKEND_URL = os.getenv("DEPLOYED_BACKEND_URL", "http://66.42.127.155:8000").rstrip("/")
+DEPLOYED_BACKEND_TIMEOUT = int(os.getenv("DEPLOYED_BACKEND_TIMEOUT", "600"))
+DEPLOYED_BACKEND_CONNECT_TIMEOUT = int(os.getenv("DEPLOYED_BACKEND_CONNECT_TIMEOUT", "15"))
+FLOORPLAN_USE_REMOTE_TACTILE = os.getenv("FLOORPLAN_USE_REMOTE_TACTILE", "false").lower() == "true"
 
 AGENT_SEED_5 = os.getenv("AGENT_SEED_5")
 AGENT_SEED_3 = os.getenv("AGENT_SEED_3")
 AGENT_SEED_4 = os.getenv("AGENT_SEED_4")
-AGENT_SEED_6 = os.getenv("AGENT_SEED_6")
 AGENT_PORT_5 = int(os.getenv("AGENT_PORT_5", "8005"))
 
 if not AGENT_SEED_5 or not AGENT_SEED_3 or not AGENT_SEED_4:
@@ -49,9 +58,6 @@ if not AGENT_SEED_5 or not AGENT_SEED_3 or not AGENT_SEED_4:
 
 MAP_ADDRESS = address_from_seed(AGENT_SEED_3)
 NARRATION_ADDRESS = address_from_seed(AGENT_SEED_4)
-RECOMMENDATIONS_ADDRESS = (
-    address_from_seed(AGENT_SEED_6) if AGENT_SEED_6 else None
-)
 
 floorplan_agent = Agent(
     name="braillemap_floorplan_analyzer",
@@ -153,9 +159,19 @@ def _strip_code_fences(text: str) -> str:
     return text.strip()
 
 
+def _decode_base64_bytes(image_base64: str) -> bytes:
+    payload = image_base64.strip()
+    if payload.startswith("data:"):
+        _, _, payload = payload.partition(",")
+    payload = re.sub(r"\s+", "", payload)
+    # Be tolerant of missing padding from external clients.
+    payload += "=" * (-len(payload) % 4)
+    return base64.b64decode(payload)
+
+
 def _decode_image(image_base64: str) -> Image.Image | None:
     try:
-        raw = base64.b64decode(image_base64)
+        raw = _decode_base64_bytes(image_base64)
         img = Image.open(BytesIO(raw))
         img.load()
         return img
@@ -163,6 +179,60 @@ def _decode_image(image_base64: str) -> Image.Image | None:
         return None
 
 
+def _materialize_floorplan_file(room_data: Dict[str, Any], image_base64: str) -> tuple[str, bool]:
+    """Return a local file path for the hosted upload call.
+
+    Prefers the file already saved by mock_backend.py. Falls back to decoding the
+    base64 payload into a temporary image file.
+    """
+    existing_path = room_data.get("floorplan_file_path")
+    if isinstance(existing_path, str) and os.path.exists(existing_path):
+        return existing_path, False
+
+    payload = image_base64.strip()
+    suffix = ".jpg"
+    if payload.startswith("data:"):
+        header, payload = payload.split(",", 1)
+        if "image/png" in header:
+            suffix = ".png"
+        elif "image/webp" in header:
+            suffix = ".webp"
+    tmp = tempfile.NamedTemporaryFile(prefix="floorplan_upload_", suffix=suffix, delete=False)
+    try:
+        tmp.write(_decode_base64_bytes(image_base64))
+        tmp.flush()
+    finally:
+        tmp.close()
+    return tmp.name, True
+
+
+def _prepare_tactile_upload_file(file_path: str) -> tuple[str, bool]:
+    """Normalize the uploaded file to PNG for the hosted tactile endpoint."""
+    try:
+        with Image.open(file_path) as img:
+            img.load()
+
+            # Keep fidelity high but cap extreme dimensions for faster remote inference.
+            max_dim = 2048
+            if max(img.size) > max_dim:
+                ratio = max_dim / max(img.size)
+                new_size = (max(1, int(img.width * ratio)), max(1, int(img.height * ratio)))
+                img = img.resize(new_size, Image.LANCZOS)
+
+            if img.mode not in ("RGB", "RGBA"):
+                img = img.convert("RGB")
+
+            tmp = tempfile.NamedTemporaryFile(
+                prefix="floorplan_tactile_upload_",
+                suffix=".png",
+                delete=False,
+            )
+            tmp.close()
+            img.save(tmp.name, format="PNG", optimize=True)
+            return tmp.name, True
+    except Exception:
+        # If conversion fails, still attempt the original file.
+        return file_path, False
 # ── Core Analysis ────────────────────────────────────────────────────────────
 
 def analyze_floor_plan(image_base64: str) -> Dict[str, Any]:
@@ -302,10 +372,42 @@ def patch_room(room_id: str, updates: Dict[str, Any]) -> None:
     resp.raise_for_status()
 
 
+async def dispatch_local_map_fallback(
+    ctx: Context,
+    room_id: str,
+    reason: str,
+    *,
+    mark_as_error: bool = True,
+) -> None:
+    updates = {
+        "status": "dispatching_local_map_fallback",
+        "status_map_done": False,
+    }
+    updates["map_error"] = reason if mark_as_error else None
+    patch_room(room_id, updates)
+    ctx.logger.warning(
+        f"[room:{room_id}] phase=local_map_fallback status=dispatch target={MAP_ADDRESS} reason={reason}"
+    )
+    await ctx.send(MAP_ADDRESS, MapGenerationRequest(room_id=room_id))
+
+
 async def process_floorplan(ctx: Context, room_id: str) -> Optional[str]:
     """Fetch room from backend, analyze image, and trigger downstream."""
-    ctx.logger.info(f"Analyzing floor plan for room {room_id}…")
-    patch_room(room_id, {"status": "analyzing_floorplan"})
+    ctx.logger.info(f"[room:{room_id}] phase=analysis status=start")
+    patch_room(
+        room_id,
+        {
+            "status": "analyzing_floorplan",
+            "map_error": None,
+            "floorplan_error": None,
+            "recommendations_error": None,
+            "recommendations_pdf_url": None,
+            "recommendations_summary": None,
+            "recommendations_score": None,
+            "recommendations_count": None,
+            "status_recommendations_done": True,
+        },
+    )
 
     # Fetch full room data to get base64 image
     try:
@@ -313,17 +415,23 @@ async def process_floorplan(ctx: Context, room_id: str) -> Optional[str]:
         resp.raise_for_status()
         room_data = resp.json()
     except Exception as exc:
-        ctx.logger.error(f"Failed to fetch room data: {exc}")
+        ctx.logger.exception(f"[room:{room_id}] phase=fetch_room_full status=failed error={exc}")
         return str(exc)
 
     image_base64 = room_data.get("floorplan_image")
     if not image_base64:
+        ctx.logger.error(f"[room:{room_id}] phase=fetch_room_full status=failed error=no floorplan_image found")
         return "No floorplan_image found in room record"
 
+    ctx.logger.info(
+        f"[room:{room_id}] phase=analysis status=calling_gemini model={GEMINI_MODEL}"
+    )
     layout = analyze_floor_plan(image_base64)
 
     if "error" in layout:
-        ctx.logger.error(f"Analysis failed: {layout['error']}")
+        ctx.logger.error(
+            f"[room:{room_id}] phase=analysis status=failed error={layout['error']}"
+        )
         patch_room(room_id, {
             "status": f"error_floorplan_{layout['error'][:50]}",
             "floorplan_error": layout.get("error"),
@@ -334,73 +442,147 @@ async def process_floorplan(ctx: Context, room_id: str) -> Optional[str]:
         "layout_2d": layout,
         "status": "floorplan_analyzed",
     })
+    ctx.logger.info(
+        f"[room:{room_id}] phase=analysis status=done walls={len(layout.get('walls') or [])} "
+        f"doors={len(layout.get('doors') or [])} windows={len(layout.get('windows') or [])} "
+        f"objects={len(layout.get('objects') or [])}"
+    )
 
-    # Call the remote agent for the tactile map and ADA report
-    image_url = room_data.get("cloudinary_floorplan_url")
+    try:
+        fresh_resp = requests.get(f"{BACKEND_URL}/rooms/{room_id}/full", timeout=10)
+        fresh_resp.raise_for_status()
+        room_data = fresh_resp.json()
+        ctx.logger.info(f"[room:{room_id}] phase=refetch_room_full status=done")
+    except Exception as exc:
+        ctx.logger.warning(
+            f"[room:{room_id}] phase=refetch_room_full status=failed error={exc}"
+        )
 
-    # Fallback: if Cloudinary URL is not available, upload the base64 image ourselves
-    if not image_url and image_base64:
-        ctx.logger.info("cloudinary_floorplan_url not found, uploading base64 image to Cloudinary...")
-        try:
-            import cloudinary
-            import cloudinary.uploader
-            cloudinary.config(
-                cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
-                api_key=os.getenv("CLOUDINARY_API_KEY"),
-                api_secret=os.getenv("CLOUDINARY_API_SECRET"),
-                secure=True,
-            )
-            img_data = image_base64
-            if not img_data.startswith("data:"):
-                img_data = f"data:image/jpeg;base64,{img_data}"
-            res = cloudinary.uploader.upload(
-                img_data,
-                folder="braillemap/floorplans",
-                public_id=f"floorplan_{room_id}",
-            )
-            image_url = res.get("secure_url")
-            if image_url:
-                patch_room(room_id, {"cloudinary_floorplan_url": image_url})
-                ctx.logger.info(f"Uploaded to Cloudinary: {image_url}")
-        except Exception as e:
-            ctx.logger.error(f"Cloudinary fallback upload failed: {e}")
-
-    if image_url:
-        ctx.logger.info(f"Calling remote tactile API with {image_url}")
-        try:
-            res = requests.post(
-                "http://66.42.127.155:8000/tactile/from-url",
-                json={"image_url": image_url, "model": "gemini-3-pro-image-preview"},
-                timeout=120
-            )
-            if res.status_code == 200:
-                tactile_data = res.json()
-                pdf_url = tactile_data.get("tactile_png_url")
-                # Attempt to get an ADA report url if it exists in the payload, otherwise fallback
-                ada_url = tactile_data.get("ada_report_url", None)
-                
-                updates = {
-                    "pdf_url": pdf_url,
-                    "status_map_done": True,
-                }
-                if ada_url:
-                    updates["recommendations_pdf_url"] = ada_url
-                    updates["status_recommendations_done"] = True
-                else:
-                    # If the remote API doesn't return ADA report, mark it done to prevent iOS app from hanging
-                    updates["status_recommendations_done"] = True
-                    
-                patch_room(room_id, updates)
-                ctx.logger.info(f"Remote tactile generation successful: {pdf_url}")
-            else:
-                ctx.logger.error(f"Remote tactile API failed: {res.status_code} {res.text}")
-        except Exception as e:
-            ctx.logger.error(f"Error calling remote tactile API: {e}")
+    if not FLOORPLAN_USE_REMOTE_TACTILE:
+        reason = "remote tactile disabled; using Agent 3 map generation"
+        ctx.logger.info(
+            f"[room:{room_id}] phase=remote_tactile status=skipped reason={reason}"
+        )
+        await dispatch_local_map_fallback(
+            ctx,
+            room_id,
+            reason,
+            mark_as_error=False,
+        )
     else:
-        ctx.logger.warning("No image URL available for remote tactile map generation.")
+        file_path, should_cleanup = _materialize_floorplan_file(room_data, image_base64)
+        if not os.path.exists(file_path):
+            err = "floorplan file missing; backend did not persist a local floorplan image"
+            ctx.logger.error(
+                f"[room:{room_id}] phase=remote_tactile status=failed error={err}"
+            )
+            patch_room(
+                room_id,
+                {
+                    "status": "error_remote_tactile_no_local_file",
+                    "map_error": err,
+                    "status_map_done": False,
+                },
+            )
+        else:
+            upload_file_path, should_cleanup_upload = _prepare_tactile_upload_file(file_path)
+            cleanup_paths = []
+            if should_cleanup:
+                cleanup_paths.append(file_path)
+            if should_cleanup_upload and upload_file_path != file_path:
+                cleanup_paths.append(upload_file_path)
+
+            try:
+                patch_room(
+                    room_id,
+                    {
+                        "status": "calling_remote_tactile",
+                        "map_error": None,
+                        "status_map_done": False,
+                        "remote_tactile_file_path": upload_file_path,
+                    },
+                )
+                ctx.logger.info(
+                    f"[room:{room_id}] phase=remote_tactile status=calling "
+                    f"endpoint=/tactile/from-upload backend={DEPLOYED_BACKEND_URL} "
+                    f"file_path={upload_file_path} source_file_path={file_path}"
+                )
+                with open(upload_file_path, "rb") as fh:
+                    res = requests.post(
+                        f"{DEPLOYED_BACKEND_URL}/tactile/from-upload",
+                        files={"file": (os.path.basename(upload_file_path), fh)},
+                        data={"model": GEMINI_MODEL},
+                        timeout=(DEPLOYED_BACKEND_CONNECT_TIMEOUT, DEPLOYED_BACKEND_TIMEOUT),
+                    )
+                if res.status_code != 200:
+                    err = f"HTTP {res.status_code}: {res.text[:500]}"
+                    ctx.logger.error(
+                        f"[room:{room_id}] phase=remote_tactile status=failed error={err}"
+                    )
+                    patch_room(
+                        room_id,
+                        {
+                            "status": "error_remote_tactile_http",
+                            "map_error": err,
+                            "status_map_done": False,
+                        },
+                    )
+                    await dispatch_local_map_fallback(ctx, room_id, err)
+                else:
+                    tactile_data = res.json()
+                    pdf_url = tactile_data.get("tactile_png_url")
+                    if not pdf_url:
+                        err = f"Hosted backend response missing tactile_png_url: {tactile_data}"
+                        ctx.logger.error(
+                            f"[room:{room_id}] phase=remote_tactile status=failed error={err}"
+                        )
+                        patch_room(
+                            room_id,
+                            {
+                                "status": "error_remote_tactile_bad_payload",
+                                "map_error": err,
+                                "status_map_done": False,
+                            },
+                        )
+                        await dispatch_local_map_fallback(ctx, room_id, err)
+                    else:
+                        patch_room(
+                            room_id,
+                            {
+                                "pdf_url": pdf_url,
+                                "status_map_done": True,
+                                "status": "map_done",
+                                "map_error": None,
+                            },
+                        )
+                        ctx.logger.info(
+                            f"[room:{room_id}] phase=remote_tactile status=done tactile_png_url={pdf_url}"
+                        )
+            except Exception as exc:
+                ctx.logger.exception(
+                    f"[room:{room_id}] phase=remote_tactile status=failed error={exc}"
+                )
+                patch_room(
+                    room_id,
+                    {
+                        "status": "error_remote_tactile_exception",
+                        "map_error": str(exc),
+                        "status_map_done": False,
+                    },
+                )
+                await dispatch_local_map_fallback(ctx, room_id, str(exc))
+            finally:
+                for path in cleanup_paths:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+    ctx.logger.info(f"[room:{room_id}] phase=ada status=disabled")
 
     # Trigger Agent 4 (Narration) directly for ElevenLabs pipeline
-    ctx.logger.info(f"→ sending NarrationRequest to {NARRATION_ADDRESS}")
+    ctx.logger.info(
+        f"[room:{room_id}] phase=narration status=dispatch target={NARRATION_ADDRESS}"
+    )
     await ctx.send(NARRATION_ADDRESS, NarrationRequest(room_id=room_id))
 
     return None
@@ -420,5 +602,6 @@ if __name__ == "__main__":
     print(f" Address       : {floorplan_agent.address}")
     print(f" Port          : {AGENT_PORT_5}")
     print(f" Model         : {GEMINI_MODEL}")
+    print(f" Hosted tactile: {DEPLOYED_BACKEND_URL}/tactile/from-upload")
     print(f" ════════════════════════════════════════════════════════════")
     floorplan_agent.run()
