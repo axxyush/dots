@@ -60,16 +60,12 @@ from agents.tools import dispatch
 from agents.wayfind_protocol import VenueLookup, VenueInfo
 from backend.map_store import MapStore
 from agents.payment import (
-    GAS_BUFFER_ATESTFET,
     PAYMENT_TIMEOUT_S,
     FAUCET_URL,
-    address_balance_atestfet,
     atestfet_to_fet_str,
-    make_wallet_from_seed,
-    payment_received,
     quote_for,
-    send_tokens,
 )
+from agents.payment_protocol import PaymentRequest, PaymentResponse
 
 logging.basicConfig(
     level=logging.INFO,
@@ -99,8 +95,6 @@ _ensure_event_loop()
 
 AGENT_SEED = os.environ.get("SENSEGRID_AGENT_SEED", "braille-map-seed-phrase")
 
-USER_PROXY_SEED = os.environ.get("SENSEGRID_USER_SEED", f"{AGENT_SEED}-user-proxy")
-user_wallet = make_wallet_from_seed(USER_PROXY_SEED)
 
 DEFAULT_DIMENSION_M = 15.0
 MAP_DB_PATH = Path(
@@ -125,6 +119,7 @@ def _new_venue_id() -> str:
 STATE_IDLE = "idle"
 STATE_QUOTED = "quoted"
 STATE_PREVIEWED = "previewed"
+STATE_AWAITING_PAYMENT = "awaiting_payment"
 
 URL_REGEX = re.compile(r"https?://[^\s<>\"]+")
 _MENTION_REGEX = re.compile(r"@\S+")
@@ -563,12 +558,6 @@ def handle_chat(
             return err, no_extra
 
         pay_addr = str(agent.wallet.address())
-        try:
-            start_balance = address_balance_atestfet(pay_addr)
-        except Exception as exc:
-            logger.exception("ledger query failed")
-            _clear_session(ctx, sender)
-            return f"Couldn't reach Fetch.ai testnet ledger: {exc}", no_extra
 
         sess.update(
             {
@@ -582,7 +571,6 @@ def handle_chat(
                 "ada_pdf_urls": ada_pdf_urls,
                 "floor_plan": first_floor_plan,
                 "dimensions_px": first_dimensions_px,
-                "start_balance_atestfet": start_balance,
                 "pay_address": pay_addr,
                 "expires_at": time.time() + PAYMENT_TIMEOUT_S,
             }
@@ -608,7 +596,6 @@ def handle_chat(
 
         n = sess["n_images"]
         plural = "s" if n > 1 else ""
-        user_addr = str(user_wallet.address())
         return (
             f"Parsed {sum(room_summary.values())} rooms across {n} image{plural} "
             f"({rooms_str}).\n\n"
@@ -618,7 +605,7 @@ def handle_chat(
             f"— I'll execute the transfer on-chain (Dorado) automatically, deliver the "
             f"tactile map, and issue a navigation **venue ID** you can post at the "
             f"entrance for blind visitors. Reply 'no' to cancel.\n\n"
-            f"_Demo wallet: `{user_addr}` — top up at {FAUCET_URL}/{user_addr} if needed._",
+            f"_Autonomous demo: my dedicated payment agent will execute this transfer for you._",
             no_extra,
         )
 
@@ -631,116 +618,74 @@ def handle_chat(
             )
 
         amount = int(sess["quoted_atestfet"])
-        user_addr = str(user_wallet.address())
-        try:
-            user_balance = address_balance_atestfet(user_addr)
-        except Exception as exc:
-            logger.exception("ledger query failed before send")
-            return f"Couldn't reach the ledger: {exc}. Try again in a few seconds.", no_extra
-
-        if user_balance < amount + GAS_BUFFER_ATESTFET:
-            return (
-                f"Demo user wallet `{user_addr}` doesn't have enough test FET "
-                f"(has {atestfet_to_fet_str(user_balance)}, needs ≥ "
-                f"{atestfet_to_fet_str(amount + GAS_BUFFER_ATESTFET)} including gas).\n\n"
-                f"Top it up once at {FAUCET_URL}/{user_addr} and reply 'yes' again.",
-                no_extra,
-            )
-
-        try:
-            tx_hash = send_tokens(user_wallet, sess["pay_address"], amount)
-            logger.info(
-                "payment broadcast: %s atestfet → %s (tx %s)",
-                amount, sess["pay_address"], tx_hash,
-            )
-        except Exception as exc:
-            logger.exception("send_tokens failed")
-            return (
-                f"Payment broadcast failed: {exc}. Reply 'yes' to retry or 'no' to cancel.",
-                no_extra,
-            )
-
-        try:
-            received, current = payment_received(
-                sess["pay_address"],
-                int(sess["start_balance_atestfet"]),
-                amount,
-            )
-        except Exception as exc:
-            logger.exception("ledger query failed during verify")
-            return (
-                f"Tx {tx_hash} broadcast but couldn't verify on-chain receipt: {exc}. "
-                "Check the Dorado explorer and reply 'yes' to retry.",
-                no_extra,
-            )
-
-        if not received:
-            got = max(0, current - int(sess["start_balance_atestfet"]))
-            return (
-                f"Tx {tx_hash} broadcast but balance hasn't reflected yet "
-                f"(saw {atestfet_to_fet_str(got)} of {sess['quoted_fet_str']} expected). "
-                "Reply 'yes' in a few seconds to retry.",
-                no_extra,
-            )
-
-        img_paths: list[str] = list(sess.get("image_paths") or [])
-        if not img_paths:
-            for p in sess.get("pre_paths", []) or []:
-                if Path(p).exists():
-                    img_paths.append(p)
-            for url in sess.get("urls", []) or []:
-                dl = dispatch("download_image", {"url": url})
-                if "error" not in dl:
-                    img_paths.append(dl["image_path"])
-
-        tactile_urls, resource_items, gen_errors = _build_tactile_content(img_paths, logger)
-
-        # Persist the venue for the Wayfind navigation agent.
-        venue_id: str | None = None
-        floor_plan = sess.get("floor_plan") if isinstance(sess.get("floor_plan"), dict) else None
-        if floor_plan:
-            venue_id = _new_venue_id()
-            try:
-                map_store.put_map(
-                    map_id=venue_id,
-                    layout_2d=floor_plan,
-                    metadata={
-                        "source": "sensegrid_agent",
-                        "longest_wall_m": float(sess.get("longest_wall_m") or DEFAULT_DIMENSION_M),
-                        "dimensions_px": sess.get("dimensions_px") or {},
-                        "rooms_by_type": sess.get("room_summary") or {},
-                        "owner": sender,
-                    },
-                    tactile_png_url=tactile_urls[0] if tactile_urls else None,
-                )
-                logger.info("persisted venue %s for sender %s", venue_id, sender[:12] + "…")
-            except Exception as exc:
-                logger.exception("failed to persist venue: %s", exc)
-                venue_id = None
-
-        _clear_session(ctx, sender)
-
-        lines = [
-            f"Payment of {sess['quoted_fet_str']} test FET confirmed on-chain (tx `{tx_hash}`)."
-        ]
-        if tactile_urls:
-            lines.append("\nTactile map URL(s):")
-            lines.extend(f"- {u}" for u in tactile_urls)
-        if gen_errors and not tactile_urls:
-            lines.append("\nTactile map generation failed:")
-            lines.extend(f"- {e}" for e in gen_errors[:6])
-        if venue_id:
-            lines.append(
-                f"\n**Navigation venue ID:** `{venue_id}`\n"
-                "Print this on a QR code or NFC tag at the entrance. Blind visitors "
-                "give this ID to the Wayfind agent on ASI:One to ask voice questions "
-                "about your space."
-            )
-        lines.append("\nThanks!")
-
-        return "\n".join(lines), resource_items
+        sess["state"] = STATE_AWAITING_PAYMENT
+        sess["pending_payment_request_amount"] = amount
+        _save_session(ctx, sender, sess)
+        
+        return "Relaying autonomous payment request... Please hold.", no_extra
 
     return "Send images to get started.", no_extra
+
+def _process_paid_map(ctx: Context, sender: str, sess: dict, tx_hash: str) -> tuple[str, list[AgentContent]]:
+    import logging
+    logger = logging.getLogger("sensegrid.agent")
+    
+    img_paths: list[str] = list(sess.get("image_paths") or [])
+    if not img_paths:
+        for p in sess.get("pre_paths", []) or []:
+            if Path(p).exists():
+                img_paths.append(p)
+        for url in sess.get("urls", []) or []:
+            dl = dispatch("download_image", {"url": url})
+            if "error" not in dl:
+                img_paths.append(dl["image_path"])
+
+    tactile_urls, resource_items, gen_errors = _build_tactile_content(img_paths, logger)
+
+    # Persist the venue for the Wayfind navigation agent.
+    venue_id: str | None = None
+    floor_plan = sess.get("floor_plan") if isinstance(sess.get("floor_plan"), dict) else None
+    if floor_plan:
+        venue_id = _new_venue_id()
+        try:
+            map_store.put_map(
+                map_id=venue_id,
+                layout_2d=floor_plan,
+                metadata={
+                    "source": "sensegrid_agent",
+                    "longest_wall_m": float(sess.get("longest_wall_m") or DEFAULT_DIMENSION_M),
+                    "dimensions_px": sess.get("dimensions_px") or {},
+                    "rooms_by_type": sess.get("room_summary") or {},
+                    "owner": sender,
+                },
+                tactile_png_url=tactile_urls[0] if tactile_urls else None,
+            )
+            logger.info("persisted venue %s for sender %s", venue_id, sender[:12] + "…")
+        except Exception as exc:
+            logger.exception("failed to persist venue: %s", exc)
+            venue_id = None
+
+    _clear_session(ctx, sender)
+
+    lines = [
+        f"Payment of {sess.get('quoted_fet_str', 'unknown')} test FET confirmed on-chain (tx `{tx_hash}`)."
+    ]
+    if tactile_urls:
+        lines.append("\nTactile map URL(s):")
+        lines.extend(f"- {u}" for u in tactile_urls)
+    if gen_errors and not tactile_urls:
+        lines.append("\nTactile map generation failed:")
+        lines.extend(f"- {e}" for e in gen_errors[:6])
+    if venue_id:
+        lines.append(
+            f"\n**Navigation venue ID:** `{venue_id}`\n"
+            "Print this on a QR code or NFC tag at the entrance. Blind visitors "
+            "give this ID to the Wayfind agent on ASI:One to ask voice questions "
+            "about your space."
+        )
+    lines.append("\nThanks!")
+
+    return "\n".join(lines), resource_items
 
 
 # ── uagent + chat protocol plumbing ──────────────────────────────────────────
@@ -789,7 +734,22 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         ctx.logger.exception("payment flow crashed")
         reply_text, extra_content = f"Something went wrong: {exc}", []
     await ctx.send(sender, _reply(reply_text, extra_content))
-
+    
+    # Check if handle_chat queued a payment request
+    sess = _load_session(ctx, sender)
+    if "pending_payment_request_amount" in sess:
+        amount = sess.pop("pending_payment_request_amount")
+        _save_session(ctx, sender, sess)
+        pay_agent = os.environ.get("PAYMENT_AGENT_ADDRESS")
+        if pay_agent:
+            await ctx.send(pay_agent, PaymentRequest(
+                session_sender=sender,
+                amount_atestfet=amount,
+                pay_address=sess["pay_address"],
+            ))
+            ctx.logger.info("Sent PaymentRequest to %s", pay_agent)
+        else:
+            ctx.logger.error("PAYMENT_AGENT_ADDRESS not configured!")
 
 @protocol.on_message(ChatAcknowledgement)
 async def on_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
@@ -797,6 +757,26 @@ async def on_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
 
 
 agent.include(protocol, publish_manifest=True)
+
+
+@agent.on_message(PaymentResponse)
+async def handle_payment_response(ctx: Context, sender: str, msg: PaymentResponse):
+    user_sender = msg.session_sender
+    sess = _load_session(ctx, user_sender)
+    if sess.get("state") != STATE_AWAITING_PAYMENT:
+        return
+    
+    if not msg.success:
+        sess["state"] = STATE_PREVIEWED
+        _save_session(ctx, user_sender, sess)
+        await ctx.send(user_sender, _reply(f"Payment execution failed: {msg.error_msg}\nReply 'yes' to retry."))
+        return
+        
+    loop = asyncio.get_event_loop()
+    reply_text, extra_content = await loop.run_in_executor(
+        None, _process_paid_map, ctx, user_sender, sess, msg.tx_hash
+    )
+    await ctx.send(user_sender, _reply(reply_text, extra_content))
 
 
 # ── Wayfind venue lookup protocol (agent-to-agent) ───────────────────────────
@@ -849,6 +829,4 @@ if __name__ == "__main__":
     log.info("SenseGrid starting.")
     log.info("Agent address: %s", agent.address)
     log.info("Service wallet (receives payments): %s", agent.wallet.address())
-    log.info("Demo user-proxy wallet (auto-pays):  %s", user_wallet.address())
-    log.info("Fund the user-proxy once at: %s/%s", FAUCET_URL, user_wallet.address())
     agent.run()
