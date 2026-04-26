@@ -67,7 +67,7 @@ OUTPUT: a single high-contrast raster image representing a tactile plaque-style 
 Hard requirements:
 - Produce a CLEAN 2D DIAGRAM (orthographic top-down). No perspective, no 3D, no camera angle.
 - White background with ONLY black marks. No colors, no gray, no gradients, no shadows.
-- Do NOT “stylize” into a plaque with dark background. This must look like a printable diagram.
+- Do NOT "stylize" into a plaque with dark background. This must look like a printable diagram.
 - Everything must fit inside the canvas with a ~5% margin. Do not draw or place text outside the border.
 - This is a tactile map, not a Braille-only map. You do NOT need to replicate every room boundary using dots.
 - You MAY use both raised lines and tactile textures:
@@ -79,12 +79,56 @@ Hard requirements:
 - Preserve topology: rooms, walls, doors, and corridors must stay in correct relative position.
 - Add clear door gaps. Mark the main entrance with a clear star marker.
 - Do NOT include numeric labels (no digits 0-9) and do NOT include a numbered legend.
-- If you include any labels at all, they must be in **Braille only** (no Latin letters, no digits).
 - Prefer an unnumbered legend that uses distinct patterns/symbols only (e.g., hatch = seating, dots = concourse, thick line = wall).
 - No decorative elements, no extra branding. Text should be minimal and aligned.
 - Printable and legible at A4 size.
+- BILINGUAL LABELS — MANDATORY: every English text label that appears on the map MUST have its
+  Grade-1 Braille translation printed directly below it (same font size as the dots in the reference).
+  This applies to ALL labels: room names, area names, legend entries, and any other text.
+  Never leave an English word on the map without its Braille equivalent directly beneath it.
+  The Braille dots must be clearly rendered and large enough to be readable on an A4 print.
 
 If the source image is cluttered, simplify while preserving navigation-critical structure.
+""".strip()
+
+_NANOBANANA_MULTIVIEW_PROMPT = """
+You are generating an accessibility tactile map for blind/low-vision users.
+
+INPUT: multiple photos of the SAME room taken from different angles and positions.
+Use ALL provided photos together to build a complete mental model of the room layout.
+Cross-reference the photos to resolve ambiguities (e.g. one photo shows a door the other obscures).
+
+OUTPUT: a single unified top-down tactile map of the room synthesised from all views.
+
+Hard requirements:
+- Produce ONE clean 2D top-down diagram. No perspective, no 3D effects.
+- White background, black marks only. No colour, no gradients, no shadows.
+- Draw the room boundary (walls) as thick continuous lines.
+- Mark every door as a clear gap in the wall with a small arc indicating swing direction.
+- Mark the main entrance/exit with a filled star ★ just inside the doorway.
+- Place each piece of furniture / fixture as a simple labelled outline rectangle or icon:
+    - Sofa / seating: filled rectangle with diagonal hatching
+    - Table: empty rectangle with label
+    - Chair: small square
+    - Bed: rectangle with a horizontal line across the top third
+    - Window: thin double line across the wall
+    - Kitchen counter / worktop: rectangle with a dotted fill
+    - Bathroom fixtures (toilet, sink, shower): recognised icons, keep simple
+  Use only shapes recognisable by touch — no decorative detail.
+- Keep furniture labels as SHORT ALL-CAPS text (e.g. SOFA, TABLE, BED).
+  If a label risks cluttering, use a legend key instead.
+- Maintain accurate relative positions and proportions between objects.
+- Add a compact legend in one corner listing any texture patterns used.
+- Do NOT include numeric IDs, room numbers, or measurement annotations.
+- Output must be printable and legible at A4 / Letter size.
+- BILINGUAL LABELS — MANDATORY: every English text label that appears on the map MUST have its
+  Grade-1 Braille translation printed directly below it.
+  This applies to ALL labels: furniture names, area names, and legend entries.
+  Never leave an English word on the map without its Braille equivalent directly beneath it.
+  The Braille dots must be clearly rendered and large enough to be readable on an A4 print.
+
+If you are uncertain about the position of something from the photos, place it with a dashed outline
+to indicate lower confidence.
 """.strip()
 
 
@@ -169,6 +213,14 @@ def qa_context_from_tactile_image_gemini(image_path: str, model: str = "gemini-2
                 return pt
         return ""
 
+    def _iter_candidate_summaries(resp_obj) -> list[str]:
+        out: list[str] = []
+        for i, cand in enumerate(getattr(resp_obj, "candidates", []) or []):
+            finish = getattr(cand, "finish_reason", None)
+            safety = getattr(cand, "safety_ratings", None)
+            out.append(f"candidate[{i}] finish_reason={finish!r} safety_ratings={safety!r}")
+        return out
+
     client = genai.Client(api_key=api_key)
     try:
         img_part = types.Part.from_bytes(data=p.read_bytes(), mime_type=_guess_mime(p))
@@ -194,7 +246,39 @@ def qa_context_from_tactile_image_gemini(image_path: str, model: str = "gemini-2
 
     text = _extract_text(resp)
     if not text:
-        return {"error": "model returned empty context"}
+        # Dump whatever we got for debugging (server + local).
+        debug_path = ARTIFACT_DIR / (p.stem + "_qa_context_debug.txt")
+        parts_txt = []
+        try:
+            parts_txt.append(f"resp.text={getattr(resp, 'text', None)!r}\n")
+            parts_txt.append("\n".join(_iter_candidate_summaries(resp)) + "\n")
+            cands = getattr(resp, "candidates", None)
+            parts_txt.append(f"resp.candidates_type={type(cands)!r}\n")
+            for i, cand in enumerate(cands or []):
+                content = getattr(cand, "content", None)
+                parts = getattr(content, "parts", None) if content else None
+                parts_txt.append(f"\n-- candidate[{i}] parts_type={type(parts)!r} --\n")
+                for j, part in enumerate(parts or []):
+                    pt = (getattr(part, "text", "") or "").strip()
+                    parts_txt.append(f"[{i}:{j}] text={pt!r}\n")
+        except Exception as exc:
+            parts_txt.append(f"\n(debug dump failed: {exc})\n")
+        debug_path.write_text("".join(parts_txt) or "(no debug text)", encoding="utf-8")
+        # Fallback: return a minimal context so the broadcast flow can still proceed.
+        # This keeps the endpoint responsive even if Gemini returns an empty message.
+        fallback = (
+            "MAP_NAME: unknown\n"
+            "ENTRANCE: unknown\n"
+            "FEATURES: unknown\n"
+            "REGIONS:\n- unknown\n"
+            "COUNTS: unknown\n"
+            "NOTES: Context extraction returned empty output; Q&A may be limited.\n"
+        )
+        return {
+            "context_text": fallback,
+            "model": model,
+            "warning": f"model returned empty context (see {debug_path})",
+        }
     return {"context_text": text, "model": model}
 
 
@@ -347,6 +431,96 @@ def tactile_map_from_image_nanobanana(image_path: str, model: str = "gemini-3-pr
             text += part.text + "\n"
     debug_path = ARTIFACT_DIR / (p.stem + "_tactile_nanobanana.txt")
     debug_path.write_text(text or "(no image returned)", encoding="utf-8")
+    return {"error": f"model returned no image (see {debug_path})"}
+
+
+def tactile_map_from_images_nanobanana(
+    image_paths: list[str],
+    model: str = "gemini-3-pro-image-preview",
+) -> dict:
+    """Generate one tactile-map PNG from multiple room photos (all sent in a single Gemini call)."""
+    if not image_paths:
+        return {"error": "no image_paths provided"}
+
+    missing = [p for p in image_paths if not Path(p).exists()]
+    if missing:
+        return {"error": f"images not found: {missing}"}
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return {"error": "GEMINI_API_KEY not set"}
+
+    try:
+        from google import genai  # type: ignore
+        from google.genai import types  # type: ignore
+    except Exception as exc:
+        return {"error": f"google-genai not available: {exc}"}
+
+    def _guess_mime(path: Path) -> str:
+        suf = path.suffix.lower()
+        if suf in {".jpg", ".jpeg"}:
+            return "image/jpeg"
+        if suf in {".webp"}:
+            return "image/webp"
+        if suf in {".gif"}:
+            return "image/gif"
+        return "image/png"
+
+    try:
+        parts: list = [types.Part(text=_NANOBANANA_MULTIVIEW_PROMPT)]
+        for img_path in image_paths:
+            p = Path(img_path)
+            parts.append(
+                types.Part.from_bytes(data=p.read_bytes(), mime_type=_guess_mime(p))
+            )
+
+        client = genai.Client(api_key=api_key)
+        cfg = types.GenerateContentConfig(
+            response_modalities=["TEXT", "IMAGE"],
+            temperature=0.0,
+        )
+        resp = client.models.generate_content(
+            model=model,
+            contents=[types.Content(role="user", parts=parts)],
+            config=cfg,
+        )
+    except Exception as exc:
+        return {"error": f"generation failed: {exc}"}
+
+    # Use the stem of the first image for the output filename.
+    stem = Path(image_paths[0]).stem
+    out_path = ARTIFACT_DIR / f"{stem}_tactile_multiview.png"
+
+    # Find first image part in response.
+    resp_parts = getattr(resp, "parts", None) or []
+    for part in resp_parts:
+        if getattr(part, "inline_data", None) is not None:
+            try:
+                img = part.as_image()
+                img.save(out_path)
+                return {"png_path": str(out_path), "model": model, "n_images": len(image_paths)}
+            except Exception as exc:
+                return {"error": f"could not save output image: {exc}"}
+
+    for cand in getattr(resp, "candidates", []) or []:
+        content = getattr(cand, "content", None)
+        if not content:
+            continue
+        for part in getattr(content, "parts", []) or []:
+            if getattr(part, "inline_data", None) is not None:
+                try:
+                    img = part.as_image()
+                    img.save(out_path)
+                    return {"png_path": str(out_path), "model": model, "n_images": len(image_paths)}
+                except Exception as exc:
+                    return {"error": f"could not save output image: {exc}"}
+
+    text_out = ""
+    for part in resp_parts:
+        if getattr(part, "text", None):
+            text_out += part.text + "\n"
+    debug_path = ARTIFACT_DIR / f"{stem}_tactile_multiview_debug.txt"
+    debug_path.write_text(text_out or "(no image returned)", encoding="utf-8")
     return {"error": f"model returned no image (see {debug_path})"}
 
 
@@ -794,6 +968,7 @@ _DISPATCH = {
     "parse_floorplan": parse_floorplan,
     "reconstruct_floorplan": reconstruct_floorplan,
     "tactile_map_from_image_nanobanana": tactile_map_from_image_nanobanana,
+    "tactile_map_from_images_nanobanana": tactile_map_from_images_nanobanana,
     "qa_context_from_floorplan_image_gemini": qa_context_from_floorplan_image_gemini,
     "qa_context_from_tactile_image_gemini": qa_context_from_tactile_image_gemini,
     "upload_artifact": upload_artifact,

@@ -4,57 +4,108 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-SenseGrid turns one or more photos of the **same room** into a tactile Braille-like ASCII map. All runnable code lives in `braille_local/`. The YOLO weights (`yolov8n.pt`) and sample photos (`room_photos/`, `top_level/`) are committed at the repo root.
+**dots** generates tactile accessibility maps for blind/low-vision users from two sources:
+- **Floorplan images** (CV + Gemini → tactile PNG via "Nano Banana" Gemini image generation)
+- **Apple RoomPlan JSON** (LiDAR → deterministic geometry → tactile PDF)
+
+The same logic is exposed two ways: as Fetch.ai `uagents` (chat protocol on Agentverse) and as a FastAPI REST backend.
 
 ## Setup & commands
 
 ```bash
-# one-time
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env  # then paste GEMINI_API_KEY
-
-# run (multi-view, default "architecture" pipeline)
-cd braille_local
-python main.py ../room_photos                      # folder of images (non-recursive)
-python main.py ../room_photos/IMG_5528.jpeg ../room_photos/IMG_5529.jpeg
-python main.py ../top_level/room-image.png --pipeline legacy
 ```
 
-Key flags: `--pipeline {depth,architecture,legacy}` (depth is default), `--grid-size {10,20}`, `--yolo-conf 0.35`, `--cluster-dist 0.34`, `--vision {auto,gemini,yolo}` (legacy only), `--gemini-model gemini-2.5-flash`.
+Create `.env` at repo root:
+```
+GEMINI_API_KEY=...
+ASI_API_KEY=...            # or ASI_ONE_API_KEY (back-compat)
+ELEVENLABS_API_KEY=...
+ELEVENLABS_AGENT_ID=...
+SENSEGRID_AGENT_SEED=...
+ROOMPLAN_BRAILLE_AGENT_SEED=...
+PUBLIC_BASE_URL=...        # optional; defaults to request base_url
+```
+
+```bash
+# Run the FastAPI backend
+.venv/bin/python -m uvicorn backend.main:app --reload
+
+# Run Fetch.ai agents (each in a separate terminal)
+.venv/bin/python agents/sensegrid_agent.py        # port 8001
+.venv/bin/python agents/roomplan_braille_agent.py  # port 8002
+
+# Nano Banana tactile image experiment (prompting test)
+.venv/bin/python scripts/test_nanobanana_tactile.py --image /path/to/floorplan.png
+```
 
 There is no test suite, linter config, or build step.
 
 ## Architecture
 
-Three pipelines feed the same rendering/Braille stage. All produce a list of grid **placements** (rectangles with a symbol) that `render_map.rasterize` paints and `braille.tactile_grid_to_braille` encodes.
+### Two access paths, shared tool layer
 
-**Pipeline 0 — `depth` (default, `_run_depth_pipeline` in `main.py`):**
-The most accurate pipeline. Fixes the core geometric problem with perspective photos: pixel-y position is *not* room depth.
-1. `detect.yolo_detections_with_depth` — YOLOv8 per image + Depth Anything V2 Small (via `transformers`) depth map per image. For each detected bbox: (a) sample the depth map at the **floor contact point** (bottom-center of bbox); (b) apply pinhole-camera perspective correction to the horizontal position; (c) use depth as the top-down Y coordinate. Falls back to a "bottom-edge-y as depth proxy" heuristic (still better than architecture pipeline) when `transformers` is not installed.
-2. `layout.build_room_layout` — same as architecture pipeline.
-3. `render_map.placements_from_norm_regions` — same as architecture pipeline.
+```
+agents/sensegrid_agent.py      ─┐
+agents/roomplan_braille_agent.py─┤ Fetch.ai chat (uagents, Agentverse mailbox)
+                                 │
+backend/main.py (FastAPI)      ──┘──► agents/tools.py (dispatch)
+                                      agents/roomplan_tools.py
+                                            │
+                                      floorplan_parser/  (flat package, bare imports)
+```
 
-Depth estimation lives in `depth.py`: `estimate_depth()` auto-detects the disparity-vs-depth convention by comparing mean values of bottom rows (floor, should be close) vs top rows (ceiling/back wall, should be far). `bbox_to_topdown()` does the pinhole projection math.
+**`agents/tools.py`** — all tools the sensegrid agent and backend can call, via a `dispatch(name, args)` function. Tools: `download_image`, `parse_floorplan`, `reconstruct_floorplan`, `tactile_map_from_image_nanobanana`, `qa_context_from_floorplan_image_gemini`, `qa_context_from_tactile_image_gemini`, `upload_artifact`. Each tool returns a dict; errors are `{"error": "..."}`.
 
-**Pipeline 1 — `architecture` (`_run_architecture` in `main.py`):**
-1. `detect.yolo_detections_multiview` — run YOLOv8 per image; keep boxes above `--yolo-conf`, drop COCO "room noise" labels (`_YOLO_ROOM_NOISE`). Emits normalized `norm_x/y/x1..y2` plus `view` index and `conf`.
-2. `layout.build_room_layout` — drop `_IGNORE_NAMES` (person, vehicles, animals), merge same-class detections across views via union-find with `cluster_dist` radius over normalized centers, then `apply_constraints` caps instances per bucket (`_BUCKET_MAX`: bed=1, chair=1, couch=1, table=2, others default 2), keeping highest-confidence.
-3. `render_map.placements_from_norm_regions` → `norm_regions_to_grid` rasterizes the merged normalized bboxes onto a `grid_size × grid_size` integer grid.
+**`agents/roomplan_tools.py`** — parallel tool layer for RoomPlan JSON: `download_json`, `tactile_map_from_roomplan_json`, `upload_artifact`.
 
-**Pipeline 2 — `legacy` (`_run_legacy` + `spatial.create_spatial_map`):**
-1. `detect.detect_objects_many` — per image, Gemini vision returns JSON (name + pixel center + bbox); YOLO is a fallback when Gemini is empty or there's no API key. `utils.extract_json_array_lenient` salvages truncated Gemini outputs.
-2. `spatial.create_spatial_map` — ask Gemini for a single 10×10 grid placement list; if Gemini is unavailable/empty, `_heuristic_grid_map` rescales to the [0,9] range.
-3. `render_map.placements_from_grid_centers` expands each cell into a rectangle using `grid_footprint_cells` name heuristics.
+### FastAPI backend (`backend/main.py`)
 
-**Rendering & Braille:** `render_map.rasterize` paints rectangles lowest-confidence-first so strong detections occlude weak ones. `render_map.symbol_for_name` picks distinct glyphs (sofa=█, bed=▓, table=▬, chair=◆, …) with unique-per-placement fallback. `braille._TACTILE` then maps each glyph to a **distinct** Braille cell so different furniture feels different under touch.
+Key endpoints:
+- `POST /maps/from-floorplan-url` — download + Nano Banana tactile PNG + Gemini Q&A context → map record
+- `POST /maps/from-floorplan-upload` — same from file upload
+- `POST /maps/from-tactile-upload` — fast path when user already has a tactile PNG
+- `POST /maps/from-roomplan` — RoomPlan JSON → tactile PDF
+- `GET /m/{map_id}` — inline HTML chat UI (no-build, uses ASI:One API for Q&A)
+- `GET /m/{map_id}/voice` — ElevenLabs Conversational AI voice Q&A page
+- `POST /m/{map_id}/voice_session` — mints a per-map ElevenLabs conversation token with a map-specific system prompt override
 
-**External calls:** all Gemini traffic flows through `gemini_client._generate`, which wraps `google.genai` in a `ThreadPoolExecutor` for a hard timeout (`_VISION_TIMEOUT_S=90`, text 2048 tokens / image 16384). Any failure/timeout returns `""` and callers degrade gracefully. `GEMINI_API_KEY` is loaded by `_load_env` from `<repo>/.env` first, then CWD `.env`.
+Map records are persisted in SQLite via `backend/map_store.py` (path: `$TMPDIR/dots_backend/maps.db`).
+
+### Chat/voice system prompts (`backend/layout_brief.py`)
+
+Two system-prompt builders:
+- `build_system_prompt(layout_2d, metadata)` — for RoomPlan-derived maps; uses `orient_relative_to_entrance` to emit object positions in "forward/left/right" language from the entrance.
+- `build_system_prompt_from_context(context_text, metadata)` — for floorplan-image maps; the context is a structured plain-text blob generated by Gemini describing the map (MAP_NAME, ENTRANCE, FEATURES, OBJECTS, etc.).
+
+Both are passed as the `system` message to ASI:One (chat) or as an override to ElevenLabs (voice).
+
+### Sensegrid agent payment flow (`agents/sensegrid_agent.py`)
+
+State machine: `idle → quoted → previewed → idle`. Payment is settled deterministically in Python (never by LLM). A user-proxy wallet (`SENSEGRID_USER_SEED`) auto-pays the service wallet on the Fetch.ai Dorado testnet. `agents/payment.py` wraps the Cosmos SDK ledger calls.
+
+### `floorplan_parser/` (flat package)
+
+Core CV + LLM library. **Must be run with `sys.path` including this directory** — it has no `__init__.py` and uses bare imports (`from cv_rooms import ...`). Both `agents/tools.py` and `agents/roomplan_tools.py` do `sys.path.insert(0, REPO_ROOT / "floorplan_parser")` at import time.
+
+Key modules:
+- `cv_parse_floorplan.py` / `cv_rooms.py` — OpenCV-based room segmentation
+- `cv_gemini_refine.py` — Gemini global-labeling pass for room types
+- `roomplan_to_layout_2d.py` — deterministic Apple RoomPlan JSON → `layout_2d` dict (no LLM)
+- `connectdots_pdf.py` — renders `layout_2d` to a tactile PDF
+- `render_map.py` — renders floor-plan JSON to a PNG preview
+- `ada_advisor.py` / `ada_report_pdf.py` — ADA compliance findings + PDF report
+
+### Artifact hosting
+
+`upload_artifact` in both tool files pushes to **tmpfiles.org** (~60 min retention). The API returns a preview URL; the tool converts it to a direct-download URL by inserting `/dl/`.
 
 ## Things to know before editing
 
-- `braille_local/` is a flat package with no `__init__.py` — imports are bare (`from detect import ...`). Run from inside that directory or adjust `sys.path`; don't reorganize into subpackages without updating every import.
-- YOLO is lazy-singleton (`detect._yolo_model`) — the first call loads `yolov8n.pt` from CWD. Keep the weights file at the repo root or run from there.
-- Coordinate convention: the **architecture** pipeline carries `norm_*` (0–1) end-to-end; the **legacy** pipeline uses pixel `x,y` and only adds `norm_*` at merge time via `render_map.enrich_objects_with_norm_bbox`. Don't mix them.
-- When adding a new furniture class, touch three places: `render_map._NAME_TO_SYMBOL` (glyph), `render_map.grid_footprint_cells` (legacy footprint), and optionally `layout._BUCKET_MAX` (cap).
-- Braille glyph assignments in `braille._TACTILE` are intentionally distinct per shape symbol; if you add a new symbol in `render_map`, add a matching Braille cell here or it falls back to `FILLED` and loses tactile distinctiveness.
+- `floorplan_parser/` is a flat package — never add `__init__.py` or reorganize into subpackages without updating every import in `agents/tools.py`, `agents/roomplan_tools.py`, `scripts/`, and `ConnectDots/`.
+- The `roomplan_braille_agent.py` calls `dispatch("braille_map_from_roomplan_json", ...)` but `roomplan_tools.py` only has `"tactile_map_from_roomplan_json"` in `_DISPATCH` — this is a known inconsistency.
+- `GEMINI_API_KEY` is loaded from `<repo>/.env` with `override=False` so shell env wins. Both tool modules do this at import time.
+- `ASI_API_KEY` and `ASI_ONE_API_KEY` are treated as aliases; the backend checks both with `or`.
+- The backend's `_public_base` helper always returns `request.base_url` for `localhost` requests, ignoring `PUBLIC_BASE_URL`, to prevent returning links to a remote host that doesn't have the local map.
+- `ConnectDots/` contains exploratory/hackathon multi-agent code and an older React dashboard. It is not wired into `backend/main.py` or the main agents.

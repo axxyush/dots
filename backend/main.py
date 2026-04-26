@@ -36,12 +36,22 @@ store = MapStore(DB_PATH)
 
 BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 ASI_API_URL = os.environ.get("ASI_API_URL", "https://api.asi1.ai/v1/chat/completions")
-ASI_API_KEY = os.environ.get("ASI_API_KEY", "")
 ASI_MODEL = os.environ.get("ASI_MODEL", "asi1-mini")
 
-ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
-ELEVENLABS_AGENT_ID = os.environ.get("ELEVENLABS_AGENT_ID", "")
 ELEVENLABS_TOKEN_URL = "https://api.elevenlabs.io/v1/convai/conversation/token"
+
+
+def _asi_api_key() -> str:
+    # Back-compat with older env naming in this repo.
+    return (os.environ.get("ASI_API_KEY") or os.environ.get("ASI_ONE_API_KEY") or "").strip()
+
+
+def _elevenlabs_api_key() -> str:
+    return (os.environ.get("ELEVENLABS_API_KEY") or "").strip()
+
+
+def _elevenlabs_agent_id() -> str:
+    return (os.environ.get("ELEVENLABS_AGENT_ID") or "").strip()
 
 
 class UrlRequest(BaseModel):
@@ -161,7 +171,7 @@ def create_map_from_floorplan_url(req: UrlRequest, request: Request) -> TactileM
         context_text=str(ctx_res.get("context_text") or ""),
     )
 
-    public_base = BASE_URL or str(request.base_url).rstrip("/")
+    public_base = _public_base(request)
     return TactileMapCreateResponse(
         map_id=map_id,
         voice_url=f"{public_base}/m/{map_id}/voice",
@@ -201,7 +211,7 @@ def create_map_from_floorplan_upload(
         context_text=str(ctx_res.get("context_text") or ""),
     )
 
-    public_base = BASE_URL or str(request.base_url).rstrip("/")
+    public_base = _public_base(request)
     return TactileMapCreateResponse(
         map_id=map_id,
         voice_url=f"{public_base}/m/{map_id}/voice",
@@ -242,7 +252,7 @@ def create_map_from_tactile_upload(
         context_text=str(ctx_res.get("context_text") or ""),
     )
 
-    public_base = BASE_URL or str(request.base_url).rstrip("/")
+    public_base = _public_base(request)
     return TactileMapCreateResponse(
         map_id=map_id,
         voice_url=f"{public_base}/m/{map_id}/voice",
@@ -288,7 +298,7 @@ def create_map_from_roomplan(req: RoomplanMapRequest, request: Request) -> MapCr
         tactile_pdf_url=up["url"],
     )
 
-    public_base = BASE_URL or str(request.base_url).rstrip("/")
+    public_base = _public_base(request)
     chat_url = f"{public_base}/m/{map_id}"
     qr_url = f"{public_base}/m/{map_id}/qr"
     return MapCreateResponse(
@@ -410,10 +420,6 @@ def map_voice_page(map_id: str) -> str:
     </div>
 
     <script type="module">
-      // ElevenLabs provides a web SDK; this import path may change by version.
-      // If it changes, we can pin to the current doc URL.
-      import {{ ElevenLabs }} from "https://cdn.jsdelivr.net/npm/@elevenlabs/client@latest/+esm";
-
       const mapId = "{map_id}";
       const status = document.getElementById("status");
       const startBtn = document.getElementById("start");
@@ -426,6 +432,15 @@ def map_voice_page(map_id: str) -> str:
 
       startBtn.onclick = async () => {{
         try {{
+          setStatus("Loading ElevenLabs web client…");
+          // ElevenLabs web SDK exports `Conversation` (not `ElevenLabs`).
+          // Use esm.sh which serves browser-friendly ESM.
+          const mod = await import("https://esm.sh/@elevenlabs/client@1.2.1");
+          const Conversation = mod?.Conversation;
+          if (!Conversation?.startSession) {{
+            setStatus("ElevenLabs web SDK failed to load (Conversation.startSession missing).");
+            return;
+          }}
           setStatus("Minting conversation token…");
           const r = await fetch(`/m/${{mapId}}/voice_session`, {{ method: "POST" }});
           const data = await r.json();
@@ -435,15 +450,18 @@ def map_voice_page(map_id: str) -> str:
           }}
 
           setStatus("Starting conversation… (allow microphone)");
-          conv = await ElevenLabs.startConversation({{
+          conv = await Conversation.startSession({{
             conversationToken: data.conversation_token,
+            connectionType: "webrtc",
             // The overrides come from our backend (map-specific prompt).
-            overrides: data.overrides
+            overrides: data.overrides,
+            onConnect: () => setStatus("Listening. Ask your question out loud."),
+            onDisconnect: () => setStatus("Disconnected."),
+            onError: (msg) => setStatus("Error: " + (msg?.message || String(msg))),
           }});
 
           startBtn.disabled = true;
           stopBtn.disabled = false;
-          setStatus("Listening. Ask your question out loud.");
         }} catch (e) {{
           setStatus("Error: " + (e?.message || String(e)));
         }}
@@ -451,7 +469,7 @@ def map_voice_page(map_id: str) -> str:
 
       stopBtn.onclick = async () => {{
         try {{
-          if (conv?.stop) await conv.stop();
+          if (conv?.endSession) await conv.endSession();
         }} catch (e) {{
           // ignore
         }}
@@ -498,9 +516,11 @@ def map_voice_session(map_id: str) -> VoiceSessionResponse:
     rec = store.get_map(map_id)
     if not rec:
         raise HTTPException(status_code=404, detail="map not found")
-    if not (ELEVENLABS_API_KEY or "").strip():
+    eleven_key = _elevenlabs_api_key()
+    eleven_agent = _elevenlabs_agent_id()
+    if not eleven_key:
         raise HTTPException(status_code=500, detail="ELEVENLABS_API_KEY not set on server")
-    if not (ELEVENLABS_AGENT_ID or "").strip():
+    if not eleven_agent:
         raise HTTPException(status_code=500, detail="ELEVENLABS_AGENT_ID not set on server")
 
     if rec.context_text:
@@ -513,8 +533,8 @@ def map_voice_session(map_id: str) -> VoiceSessionResponse:
 
     resp = requests.get(
         ELEVENLABS_TOKEN_URL,
-        params={"agent_id": ELEVENLABS_AGENT_ID},
-        headers={"xi-api-key": ELEVENLABS_API_KEY},
+        params={"agent_id": eleven_agent},
+        headers={"xi-api-key": eleven_key},
         timeout=10,
     )
     if not resp.ok:
@@ -538,7 +558,7 @@ def map_voice_session(map_id: str) -> VoiceSessionResponse:
 
     return VoiceSessionResponse(
         conversation_token=str(token),
-        agent_id=str(ELEVENLABS_AGENT_ID),
+        agent_id=str(eleven_agent),
         overrides=overrides,
     )
 
@@ -549,7 +569,8 @@ def map_chat(map_id: str, req: ChatRequest) -> ChatResponse:
     if not rec:
         raise HTTPException(status_code=404, detail="map not found")
 
-    if not (ASI_API_KEY or "").strip():
+    asi_key = _asi_api_key()
+    if not asi_key:
         raise HTTPException(status_code=500, detail="ASI_API_KEY not set on server")
 
     session_id = (req.session_id or "").strip() or uuid.uuid4().hex[:16]
@@ -571,7 +592,7 @@ def map_chat(map_id: str, req: ChatRequest) -> ChatResponse:
 
     resp = requests.post(
         ASI_API_URL,
-        headers={"Authorization": f"Bearer {ASI_API_KEY}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {asi_key}", "Content-Type": "application/json"},
         json={"model": ASI_MODEL, "messages": messages, "temperature": 0.2, "max_tokens": 400},
         timeout=60,
     )
@@ -588,4 +609,16 @@ def map_chat(map_id: str, req: ChatRequest) -> ChatResponse:
 def json_dumps_compact(obj) -> str:
     import json
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+
+
+def _public_base(request: Request) -> str:
+    """
+    Prefer request.base_url during local testing even if PUBLIC_BASE_URL is set.
+    This prevents returning links to a remote server that doesn't have the local map_id.
+    """
+    req_base = str(request.base_url).rstrip("/")
+    host = (request.url.hostname or "").lower() if getattr(request, "url", None) else ""
+    if host in {"127.0.0.1", "localhost"}:
+        return req_base
+    return BASE_URL or req_base
 

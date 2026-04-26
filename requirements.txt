@@ -10,3 +10,4 @@ pybraille>=1.0.0
 fastapi>=0.115.0
 uvicorn>=0.32.0
 python-multipart>=0.0.9
+google-genai>=1.73.0
