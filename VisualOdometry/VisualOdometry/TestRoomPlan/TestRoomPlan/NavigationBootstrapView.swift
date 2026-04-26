@@ -108,7 +108,7 @@ struct NavigationBootstrapView: View {
                     .dotsPanel()
                 } else {
                     ForEach(savedModels) { model in
-                        HStack(spacing: 10) {
+                        VStack(spacing: 10) {
                             Button {
                                 loadSavedModel(roomID: model.roomID)
                             } label: {
@@ -134,6 +134,69 @@ struct NavigationBootstrapView: View {
                                         Text(model.hasVisualMesh ? "Visual mesh attached" : "No visual mesh")
                                             .font(.caption)
                                             .foregroundStyle(model.hasVisualMesh ? .green : DotsTheme.secondaryText)
+                                        HStack{
+                                            Button {
+                                                showPreview(roomID: model.roomID)
+                                            } label: {
+                                                Image(systemName: "eye.fill")
+                                                    .font(.system(size: 20, weight: .semibold))
+                                                    .foregroundStyle(.white)
+                                                    .frame(width: 60, height: 60)
+                                                    .background(
+                                                        RoundedRectangle(cornerRadius: 16)
+                                                            .fill(DotsTheme.panelStrong)
+                                                    )
+                                                    .overlay(
+                                                        RoundedRectangle(cornerRadius: 16)
+                                                            .stroke(DotsTheme.border, lineWidth: 1)
+                                                    )
+                                            }
+                                            .buttonStyle(.plain)
+                                            .accessibilityLabel("Preview \(model.title)")
+                                            .accessibilityHint("Opens a 3D preview from the saved entry-door point of view.")
+
+                                            Button {
+                                                beginVisualMeshImport(for: model.roomID)
+                                            } label: {
+                                                Image(systemName: model.hasVisualMesh ? "square.and.arrow.down.badge.checkmark" : "square.and.arrow.down")
+                                                    .font(.system(size: 20, weight: .semibold))
+                                                    .foregroundStyle(.white)
+                                                    .frame(width: 60, height: 60)
+                                                    .background(
+                                                        RoundedRectangle(cornerRadius: 16)
+                                                            .fill(DotsTheme.panelStrong)
+                                                    )
+                                                    .overlay(
+                                                        RoundedRectangle(cornerRadius: 16)
+                                                            .stroke(DotsTheme.border, lineWidth: 1)
+                                                    )
+                                            }
+                                            .buttonStyle(.plain)
+                                            .accessibilityLabel(model.hasVisualMesh ? "Replace visual mesh for \(model.title)" : "Import visual mesh for \(model.title)")
+                                            .accessibilityHint("Imports a USDZ file, such as a Polycam export, and stores it with this saved room model.")
+
+                                            Button {
+                                                roomIDPendingDeletion = model.roomID
+                                                showDeleteConfirmation = true
+                                            } label: {
+                                                Image(systemName: "trash.fill")
+                                                    .font(.system(size: 18, weight: .semibold))
+                                                    .foregroundStyle(.red.opacity(0.9))
+                                                    .frame(width: 60, height: 60)
+                                                    .background(
+                                                        RoundedRectangle(cornerRadius: 16)
+                                                            .fill(Color.red.opacity(0.1))
+                                                    )
+                                                    .overlay(
+                                                        RoundedRectangle(cornerRadius: 16)
+                                                            .stroke(Color.red.opacity(0.3), lineWidth: 1)
+                                                    )
+                                            }
+                                            .buttonStyle(.plain)
+                                            .accessibilityLabel("Delete \(model.title)")
+                                            .accessibilityHint("Permanently removes this room model and all associated data.")   
+                                        }
+                                        
                                     }
 
                                     Spacer()
@@ -155,67 +218,6 @@ struct NavigationBootstrapView: View {
                             .buttonStyle(.plain)
                             .accessibilityLabel(model.title)
                             .accessibilityHint("Loads this saved room model for local navigation alignment.")
-
-                            Button {
-                                showPreview(roomID: model.roomID)
-                            } label: {
-                                Image(systemName: "eye.fill")
-                                    .font(.system(size: 20, weight: .semibold))
-                                    .foregroundStyle(.white)
-                                    .frame(width: 60, height: 60)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 16)
-                                            .fill(DotsTheme.panelStrong)
-                                    )
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 16)
-                                            .stroke(DotsTheme.border, lineWidth: 1)
-                                    )
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel("Preview \(model.title)")
-                            .accessibilityHint("Opens a 3D preview from the saved entry-door point of view.")
-
-                            Button {
-                                beginVisualMeshImport(for: model.roomID)
-                            } label: {
-                                Image(systemName: model.hasVisualMesh ? "square.and.arrow.down.badge.checkmark" : "square.and.arrow.down")
-                                    .font(.system(size: 20, weight: .semibold))
-                                    .foregroundStyle(.white)
-                                    .frame(width: 60, height: 60)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 16)
-                                            .fill(DotsTheme.panelStrong)
-                                    )
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 16)
-                                            .stroke(DotsTheme.border, lineWidth: 1)
-                                    )
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel(model.hasVisualMesh ? "Replace visual mesh for \(model.title)" : "Import visual mesh for \(model.title)")
-                            .accessibilityHint("Imports a USDZ file, such as a Polycam export, and stores it with this saved room model.")
-
-                            Button {
-                                roomIDPendingDeletion = model.roomID
-                                showDeleteConfirmation = true
-                            } label: {
-                                Image(systemName: "trash.fill")
-                                    .font(.system(size: 18, weight: .semibold))
-                                    .foregroundStyle(.red.opacity(0.9))
-                                    .frame(width: 60, height: 60)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 16)
-                                            .fill(Color.red.opacity(0.1))
-                                    )
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 16)
-                                            .stroke(Color.red.opacity(0.3), lineWidth: 1)
-                                    )
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel("Delete \(model.title)")
-                            .accessibilityHint("Permanently removes this room model and all associated data.")
                         }
                     }
                 }

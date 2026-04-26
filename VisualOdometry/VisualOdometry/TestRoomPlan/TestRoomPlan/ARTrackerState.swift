@@ -51,10 +51,21 @@ final class ARTrackerProcessor {
     /// Call this on every `ARFrame` update from the session delegate.
     @MainActor
     func processFrame(_ frame: ARFrame) {
-        let transform = frame.camera.transform
+        processTransform(
+            transform: frame.camera.transform,
+            trackingState: frame.camera.trackingState,
+            eulerAnglesY: frame.camera.eulerAngles.y
+        )
+    }
 
-        // Update tracking state from camera tracking quality
-        switch frame.camera.trackingState {
+    /// Frame-free variant — avoids retaining the ARFrame across an async boundary.
+    @MainActor
+    func processTransform(
+        transform: simd_float4x4,
+        trackingState: ARCamera.TrackingState,
+        eulerAnglesY: Float
+    ) {
+        switch trackingState {
         case .normal:
             state.isTracking = true
         default:
@@ -75,7 +86,6 @@ final class ARTrackerProcessor {
 
             // Ignore jitter below 5mm
             if distanceMoved > 0.005 {
-                // Determine forward vs backward using camera heading
                 let forwardVector = SIMD3<Float>(
                     -transform.columns.2.x,
                     -transform.columns.2.y,
@@ -97,8 +107,7 @@ final class ARTrackerProcessor {
         detectStep(currentY: currentPos.y)
 
         // 3. Compass heading
-        // With .gravityAndHeading: yaw=0 → North, yaw=-π/2 → East, yaw=π/2 → West
-        let yaw = frame.camera.eulerAngles.y
+        let yaw = eulerAnglesY
         var bearing = Double(-yaw * 180.0 / .pi)
         if bearing < 0 {
             bearing += 360.0

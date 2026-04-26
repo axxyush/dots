@@ -1,3 +1,4 @@
+import AudioToolbox
 import SwiftUI
 
 // MARK: - Conversation Message
@@ -47,7 +48,6 @@ struct NavigationCompassView: View {
 struct NavigationStatsHUD: View {
     let distanceRemaining: String
     let distanceWalked: Float
-    let stepsTaken: Int
     let heading: Double
     let startingPoint: String
     let destinationName: String?
@@ -55,65 +55,46 @@ struct NavigationStatsHUD: View {
     let facingText: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 8) {
             // Instruction
             Text(instruction)
-                .font(.title3.weight(.semibold))
+                .font(.callout.weight(.semibold))
                 .foregroundStyle(.white)
+                .accessibilityLabel(instruction)
 
             // Route label: Starting Point → Destination
-            HStack(spacing: 8) {
-                HStack(spacing: 5) {
-                    Image(systemName: "circle.fill")
-                        .font(.system(size: 7))
-                        .foregroundStyle(.green)
-                    Text(startingPoint)
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.white.opacity(0.85))
-                }
+            HStack(spacing: 6) {
+                Image(systemName: "circle.fill")
+                    .font(.system(size: 6))
+                    .foregroundStyle(.green)
+                Text(startingPoint)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.white.opacity(0.85))
 
                 Image(systemName: "arrow.right")
-                    .font(.caption2.weight(.bold))
+                    .font(.system(size: 8, weight: .bold))
                     .foregroundStyle(.white.opacity(0.5))
 
                 if let dest = destinationName {
-                    HStack(spacing: 5) {
-                        Image(systemName: "mappin.circle.fill")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.yellow)
-                        Text(dest)
-                            .font(.caption.weight(.medium))
-                            .foregroundStyle(.white.opacity(0.85))
-                    }
+                    Image(systemName: "mappin.circle.fill")
+                        .font(.system(size: 8))
+                        .foregroundStyle(.yellow)
+                    Text(dest)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.white.opacity(0.85))
                 }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(Color.white.opacity(0.06))
-            .clipShape(Capsule())
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Route from \(startingPoint) to \(destinationName ?? "destination")")
 
-            Text("Facing \(facingText)")
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.white.opacity(0.72))
-
-            // Stats row
-            HStack(spacing: 16) {
-                statItem(title: "REMAINING", value: distanceRemaining)
+            HStack(spacing: 12) {
+                statItem(title: "LEFT", value: distanceRemaining)
                 statItem(title: "WALKED", value: String(format: "%.1f m", distanceWalked))
-                statItem(title: "STEPS", value: "\(stepsTaken)")
-
+                statItem(title: "FACING", value: facingText)
                 Spacer()
-
                 NavigationCompassView(heading: heading)
             }
         }
-        .padding(16)
-        .background(.black.opacity(0.84))
-        .clipShape(RoundedRectangle(cornerRadius: 18))
-        .overlay(
-            RoundedRectangle(cornerRadius: 18)
-                .stroke(Color.white.opacity(0.14), lineWidth: 1)
-        )
     }
 
     private func statItem(title: String, value: String) -> some View {
@@ -132,26 +113,28 @@ struct NavigationStatsHUD: View {
     }
 }
 
-// MARK: - Navigation Assistant View
+// MARK: - Navigation Assistant View (Voice-First)
 
-/// Conversational "How can I help?" panel shown after room alignment.
-/// Handles voice/text input to determine destination, then transitions to active navigation.
+/// Voice-first navigation assistant. Listens for "Hey Dots" wake word,
+/// captures commands, and auto-submits after 2 seconds of silence.
+/// Keeps a visible transcript for sighted helpers and quick-tap destination chips.
 struct NavigationAssistantView: View {
     @Binding var messages: [ConversationMessage]
     let destinationNames: [String]
+    let roomContext: String
     let onNavigationRequested: (_ sourceName: String?, _ destinationName: String) -> NavigationRequestResult
     let onStopNavigation: () -> Void
     let isNavigationActive: Bool
 
-    @StateObject private var speechManager = SpeechRecognitionManager()
-    @State private var textInput: String = ""
-    @State private var hasGreeted: Bool = false
+    @StateObject private var wakeWordListener = WakeWordListener()
+    @StateObject private var intentRouter = ZeticIntentRouter()
+    @State private var isProcessing = false
 
     private let speechEngine = NavigationSpeechEngine()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            // Conversation transcript
+            // Transcript (read-only, for sighted helpers)
             if !messages.isEmpty {
                 ScrollViewReader { proxy in
                     ScrollView {
@@ -163,7 +146,7 @@ struct NavigationAssistantView: View {
                         }
                         .padding(.vertical, 4)
                     }
-                    .frame(maxHeight: 160)
+                    .frame(maxHeight: 140)
                     .onChange(of: messages.count) { _, _ in
                         if let last = messages.last {
                             withAnimation(.easeOut(duration: 0.2)) {
@@ -175,54 +158,10 @@ struct NavigationAssistantView: View {
             }
 
             if !isNavigationActive {
-                // Input area
-                HStack(spacing: 10) {
-                    TextField("e.g. Take me to the bathroom", text: $textInput)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 16, design: .rounded))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 12)
-                        .background(
-                            RoundedRectangle(cornerRadius: 14)
-                                .fill(Color.white.opacity(0.08))
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 14)
-                                .stroke(Color.white.opacity(0.15), lineWidth: 1)
-                        )
-                        .submitLabel(.send)
-                        .onSubmit { handleTextSubmit() }
+                // Voice status indicator
+                voiceStatusIndicator
 
-                    // Mic button
-                    Button {
-                        toggleSpeechInput()
-                    } label: {
-                        Image(systemName: speechManager.isListening ? "mic.fill" : "mic")
-                            .font(.system(size: 20, weight: .semibold))
-                            .foregroundStyle(speechManager.isListening ? .black : .white)
-                            .frame(width: 48, height: 48)
-                            .background(
-                                Circle().fill(speechManager.isListening ? Color.white : Color.white.opacity(0.1))
-                            )
-                            .overlay(
-                                Circle().stroke(Color.white.opacity(0.2), lineWidth: 1)
-                            )
-                    }
-                    .accessibilityLabel(speechManager.isListening ? "Stop listening" : "Start listening")
-
-                    // Send button
-                    Button {
-                        handleTextSubmit()
-                    } label: {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.system(size: 32))
-                            .foregroundStyle(.white.opacity(textInput.isEmpty ? 0.3 : 0.9))
-                    }
-                    .disabled(textInput.trimmingCharacters(in: .whitespaces).isEmpty)
-                }
-
-                // Quick destination chips
+                // Quick destination chips (accessible via VoiceOver tap)
                 if !destinationNames.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 8) {
@@ -242,6 +181,7 @@ struct NavigationAssistantView: View {
                                             Capsule().stroke(Color.white.opacity(0.2), lineWidth: 1)
                                         )
                                 }
+                                .accessibilityLabel("Navigate to \(name)")
                             }
                         }
                     }
@@ -264,55 +204,151 @@ struct NavigationAssistantView: View {
         )
         .onAppear {
             greetUser()
+            Task { await intentRouter.loadModel() }
+            setupWakeWord()
         }
-        .onChange(of: speechManager.transcribedText) { _, newText in
-            if !newText.isEmpty {
-                textInput = newText
-            }
+        .onDisappear {
+            wakeWordListener.stopEverything()
         }
     }
 
-    // MARK: - Actions
+    // MARK: - Voice Status Indicator
+
+    private var voiceStatusIndicator: some View {
+        HStack(spacing: 12) {
+            // Animated mic indicator
+            ZStack {
+                Circle()
+                    .fill(micColor.opacity(0.15))
+                    .frame(width: 48, height: 48)
+
+                Circle()
+                    .fill(micColor.opacity(wakeWordListener.isCommandActive ? 0.3 : 0))
+                    .frame(width: 48, height: 48)
+                    .scaleEffect(wakeWordListener.isCommandActive ? 1.4 : 1.0)
+                    .animation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true), value: wakeWordListener.isCommandActive)
+
+                Image(systemName: micIconName)
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(micColor)
+            }
+            .accessibilityLabel(micAccessibilityLabel)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(statusText)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.white)
+
+                if wakeWordListener.isCommandActive && !wakeWordListener.commandText.isEmpty {
+                    Text(wakeWordListener.commandText)
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.7))
+                        .lineLimit(2)
+                } else if isProcessing {
+                    Text("Processing…")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.5))
+                } else {
+                    Text("Say \"Hey Dots\" to start")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.5))
+                }
+            }
+
+            Spacer()
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var micColor: Color {
+        if wakeWordListener.isCommandActive { return .green }
+        if wakeWordListener.isPassiveListening { return .white }
+        return .gray
+    }
+
+    private var micIconName: String {
+        if wakeWordListener.isCommandActive { return "waveform" }
+        if wakeWordListener.isPassiveListening { return "mic.fill" }
+        return "mic.slash"
+    }
+
+    private var statusText: String {
+        if isProcessing { return "Thinking…" }
+        if wakeWordListener.isCommandActive { return "Listening…" }
+        if wakeWordListener.isPassiveListening { return "Ready" }
+        return "Starting…"
+    }
+
+    private var micAccessibilityLabel: String {
+        if wakeWordListener.isCommandActive { return "Recording your command" }
+        if wakeWordListener.isPassiveListening { return "Listening for Hey Dots" }
+        return "Microphone inactive"
+    }
+
+    // MARK: - Setup
 
     private func greetUser() {
-        guard !hasGreeted else { return }
-        hasGreeted = true
-        let greeting = "How can I help you today? Tell me where you'd like to go."
+        let greeting = "How can I help you? Say Hey Dots, then tell me where you'd like to go."
         messages.append(ConversationMessage(role: .assistant, text: greeting))
         speechEngine.speak(greeting)
     }
 
-    private func handleTextSubmit() {
-        let text = textInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
+    private func setupWakeWord() {
+        wakeWordListener.onWakeWord = { [self] in
+            // Play a brief auditory cue that we're listening
+            AudioServicesPlaySystemSound(1113) // Tink sound
+        }
 
-        messages.append(ConversationMessage(role: .user, text: text))
-        textInput = ""
-        speechManager.stopListening()
+        wakeWordListener.onCommandReady = { [self] command in
+            handleVoiceCommand(command)
+        }
 
-        parseAndNavigate(text)
-    }
-
-    private func toggleSpeechInput() {
-        if speechManager.isListening {
-            speechManager.stopListening()
-            // If we got text, submit it
-            let text = speechManager.transcribedText.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !text.isEmpty {
-                textInput = text
-                handleTextSubmit()
-            }
-        } else {
-            speechManager.resetTranscription()
+        // Start passive listening after greeting finishes
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
             Task {
-                let authorized = await speechManager.requestAuthorization()
+                let authorized = await SpeechRecognitionManager().requestAuthorization()
                 if authorized {
-                    speechManager.startListening()
+                    wakeWordListener.startPassiveListening()
                 } else {
                     messages.append(ConversationMessage(
                         role: .assistant,
-                        text: "I need microphone access for voice input. You can type your destination instead."
+                        text: "I need microphone access to listen for your commands. Please enable it in Settings."
                     ))
+                }
+            }
+        }
+    }
+
+    // MARK: - Command Processing
+
+    private func handleVoiceCommand(_ text: String) {
+        messages.append(ConversationMessage(role: .user, text: text))
+        isProcessing = true
+
+        // Pause listening while we process
+        wakeWordListener.pauseListening()
+
+        Task {
+            let result = await intentRouter.resolveIntent(
+                userText: text,
+                destinations: destinationNames,
+                roomContext: roomContext
+            )
+
+            await MainActor.run {
+                isProcessing = false
+
+                switch result {
+                case .navigate(let destinationName):
+                    sendNavigationRequest(sourceName: nil, destinationName: destinationName)
+
+                case .answer(let answerText):
+                    messages.append(ConversationMessage(role: .assistant, text: answerText))
+                    speechEngine.speak(answerText)
+
+                case .unknown:
+                    // Try raw text as destination name
+                    sendNavigationRequest(sourceName: nil, destinationName: text)
                 }
             }
         }
@@ -321,15 +357,6 @@ struct NavigationAssistantView: View {
     private func chooseDestination(_ name: String) {
         messages.append(ConversationMessage(role: .user, text: "Take me to \(name)"))
         sendNavigationRequest(sourceName: nil, destinationName: name)
-    }
-
-    private func parseAndNavigate(_ text: String) {
-        if let route = parseExplicitRoute(text) {
-            sendNavigationRequest(sourceName: route.source, destinationName: route.destination)
-            return
-        }
-
-        sendNavigationRequest(sourceName: nil, destinationName: text)
     }
 
     private func sendNavigationRequest(sourceName: String?, destinationName: String) {
@@ -346,40 +373,6 @@ struct NavigationAssistantView: View {
 
         messages.append(ConversationMessage(role: .assistant, text: response))
         speechEngine.speak(response)
-    }
-
-    private func parseExplicitRoute(_ text: String) -> (source: String, destination: String)? {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-
-        let arrowParts = trimmed.components(separatedBy: "->").map {
-            $0.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        if arrowParts.count == 2, !arrowParts[0].isEmpty, !arrowParts[1].isEmpty {
-            return (arrowParts[0], arrowParts[1])
-        }
-
-        let lowered = trimmed.lowercased()
-        guard
-            let fromRange = lowered.range(of: "from "),
-            let toRange = lowered.range(of: " to ", range: fromRange.upperBound..<lowered.endIndex)
-        else {
-            return nil
-        }
-
-        let sourceStartOffset = lowered.distance(from: lowered.startIndex, to: fromRange.upperBound)
-        let sourceEndOffset = lowered.distance(from: lowered.startIndex, to: toRange.lowerBound)
-        let destinationStartOffset = lowered.distance(from: lowered.startIndex, to: toRange.upperBound)
-
-        let sourceStart = trimmed.index(trimmed.startIndex, offsetBy: sourceStartOffset)
-        let sourceEnd = trimmed.index(trimmed.startIndex, offsetBy: sourceEndOffset)
-        let destinationStart = trimmed.index(trimmed.startIndex, offsetBy: destinationStartOffset)
-
-        let source = String(trimmed[sourceStart..<sourceEnd]).trimmingCharacters(in: .whitespacesAndNewlines)
-        let destination = String(trimmed[destinationStart...]).trimmingCharacters(in: .whitespacesAndNewlines)
-
-        guard !source.isEmpty, !destination.isEmpty else { return nil }
-        return (source, destination)
     }
 
     // MARK: - Bubble

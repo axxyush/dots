@@ -39,10 +39,15 @@ final class DynamicObstacleDetector {
     }
 
     func detectObstacle(frame: ARFrame) -> DynamicObstacleHit? {
-        let cameraTransform = frame.camera.transform
-        let cameraInverse = cameraTransform.inverse
-        let meshAnchors = frame.anchors.compactMap { $0 as? ARMeshAnchor }
+        detectObstacle(
+            cameraTransform: frame.camera.transform,
+            meshAnchors: frame.anchors.compactMap { $0 as? ARMeshAnchor }
+        )
+    }
 
+    /// Frame-free overload — avoids retaining the ARFrame.
+    func detectObstacle(cameraTransform: simd_float4x4, meshAnchors: [ARMeshAnchor]) -> DynamicObstacleHit? {
+        let cameraInverse = cameraTransform.inverse
         var closest: DynamicObstacleHit?
 
         for anchor in meshAnchors {

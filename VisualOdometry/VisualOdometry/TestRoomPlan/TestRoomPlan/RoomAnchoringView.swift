@@ -33,7 +33,10 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
     private var navigator: RoomNavigator?
     private var obstacleDetector: DynamicObstacleDetector?
     private let speechEngine = NavigationSpeechEngine()
-    private let hapticsEngine = NavigationHapticsEngine()
+    private var lastNavigationUpdateDate = Date.distantPast
+    private var lastPathRenderDate = Date.distantPast
+    private let obstacleQueue = DispatchQueue(label: "dots.obstacle", qos: .userInitiated)
+    private let zeticClassifier = ZeticVisionClassifier()
     private var destinationWorldPoint: SIMD3<Float>?
     @Published private(set) var remainingWaypoints: [SIMD3<Float>] = []
     @Published private(set) var renderedPath: [SIMD3<Float>] = []
@@ -46,6 +49,28 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
         self.envelope = envelope
         self.visualMeshURL = visualMeshURL
         super.init()
+    }
+
+    /// Plain-text summary of the room for LLM context.
+    var roomContextSummary: String {
+        let snap = envelope.capturedRoomSnapshot
+        let bounds = snap.roomBounds
+        var lines: [String] = []
+        lines.append(String(format: "Room dimensions: %.1fm wide × %.1fm deep × %.1fm tall.",
+                            bounds.widthMeters, bounds.depthMeters, bounds.heightMeters))
+        lines.append("Walls: \(snap.walls.count). Doors: \(snap.doors.count). Windows: \(snap.windows.count). Objects: \(snap.objects.count).")
+
+        for door in snap.doors {
+            lines.append("- Door: \(RoomLabeling.displayName(for: door)) (width: \(String(format: "%.1fm", door.dimensionsMeters.x)))")
+        }
+        for obj in snap.objects {
+            lines.append("- Object: \(RoomLabeling.displayName(for: obj)) (\(obj.category), \(String(format: "%.1fm × %.1fm", obj.dimensionsMeters.x, obj.dimensionsMeters.z)))")
+        }
+
+        if let anchor = envelope.entryAnchor.anchorType {
+            lines.append("Entry point: \(anchor) #\((envelope.entryAnchor.anchorIndex ?? 0) + 1).")
+        }
+        return lines.joined(separator: "\n")
     }
 
     func attach(arView: ARView) {
@@ -103,6 +128,9 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
 
         renderRoom(at: roomTransform)
         stopNavigation(resetInstruction: false)
+
+        // Lazy-load ZETIC on-device vision model on first alignment
+        Task { await zeticClassifier.loadModel() }
     }
 
     @discardableResult
@@ -207,18 +235,47 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
         }
     }
 
+    // MARK: - ARSession Delegate (Frame-Free Design)
+    //
+    // CRITICAL: Extract all needed values from ARFrame synchronously on
+    // the ARKit callback thread. The ARFrame is released when this returns.
+
+    private struct FrameSnapshot {
+        let cameraTransform: simd_float4x4
+        let trackingState: ARCamera.TrackingState
+        let eulerAnglesY: Float
+        let meshAnchors: [ARMeshAnchor]?
+        let pixelBuffer: CVPixelBuffer?
+    }
+
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        Task { @MainActor in
-            self.handleFrameUpdate(frame)
-            // Update odometry tracker on every frame
-            self.trackerProcessor.processFrame(frame)
+        let needsObstacle = isNavigationActive
+            && obstacleDetector != nil
+            && Date().timeIntervalSince(lastObstacleAlertDate) > 2.0
+
+        let snapshot = FrameSnapshot(
+            cameraTransform: frame.camera.transform,
+            trackingState: frame.camera.trackingState,
+            eulerAnglesY: frame.camera.eulerAngles.y,
+            meshAnchors: needsObstacle ? frame.anchors.compactMap { $0 as? ARMeshAnchor } : nil,
+            pixelBuffer: needsObstacle ? frame.capturedImage : nil
+        )
+        // ARFrame is released here — only lightweight snapshot crosses threads
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.trackerProcessor.processTransform(
+                transform: snapshot.cameraTransform,
+                trackingState: snapshot.trackingState,
+                eulerAnglesY: snapshot.eulerAnglesY
+            )
+            self.handleFrameSnapshot(snapshot)
         }
     }
 
     @MainActor
-    private func handleFrameUpdate(_ frame: ARFrame) {
-        trackingQuality = TrackingQuality(trackingState: frame.camera.trackingState)
-        currentCameraTransform = frame.camera.transform
+    private func handleFrameSnapshot(_ snapshot: FrameSnapshot) {
+        trackingQuality = TrackingQuality(trackingState: snapshot.trackingState)
+        currentCameraTransform = snapshot.cameraTransform
 
         if !isReady {
             switch TrackingGate.decision(for: trackingQuality) {
@@ -235,20 +292,28 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
             return
         }
 
-        let currentPosition = RoomGeometry.translation(of: frame.camera.transform)
+        let currentPosition = SIMD3<Float>(
+            snapshot.cameraTransform.columns.3.x,
+            snapshot.cameraTransform.columns.3.y,
+            snapshot.cameraTransform.columns.3.z
+        )
         destinationResolver?.updateUserWorldPosition(currentPosition)
         statusMessage = "Room aligned to the live camera feed."
         if let roomWorldTransform {
-            facingSurfaceName = facingSurfaceName(for: frame.camera.transform, roomWorldTransform: roomWorldTransform)
+            facingSurfaceName = facingSurfaceName(for: snapshot.cameraTransform, roomWorldTransform: roomWorldTransform)
         }
 
         if isNavigationActive {
-            advanceNavigation(frame: frame, currentPosition: currentPosition)
+            let now = Date()
+            if now.timeIntervalSince(lastNavigationUpdateDate) >= 0.1 {
+                lastNavigationUpdateDate = now
+                advanceNavigation(snapshot: snapshot, currentPosition: currentPosition)
+            }
         }
     }
 
     @MainActor
-    private func advanceNavigation(frame: ARFrame, currentPosition: SIMD3<Float>) {
+    private func advanceNavigation(snapshot: FrameSnapshot, currentPosition: SIMD3<Float>) {
         guard
             let destinationWorldPoint,
             let activeDestinationName,
@@ -269,7 +334,6 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
             renderPath(clearOnly: true)
             isNavigationActive = false
             speechEngine.speak("You have arrived at \(activeDestinationName).")
-            hapticsEngine.playArrival()
             return
         }
 
@@ -285,12 +349,16 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
         }
 
         renderedPath = pathWithDestination(remainingWaypoints, destination: destinationWorldPoint)
-        renderPath()
+        let now = Date()
+        if now.timeIntervalSince(lastPathRenderDate) >= 0.5 {
+            lastPathRenderDate = now
+            renderPath()
+        }
 
         let nextWaypoint = remainingWaypoints.first ?? destinationWorldPoint
         let distanceToNext = NavigationGuidanceMath.planarDistance(currentPosition, nextWaypoint)
         let turnAngle = NavigationGuidanceMath.turnAngleDegrees(
-            currentHeadingTransform: frame.camera.transform,
+            currentHeadingTransform: snapshot.cameraTransform,
             targetWorldPoint: nextWaypoint,
             currentWorldPoint: currentPosition
         )
@@ -302,11 +370,6 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
             let announcementKey = "\(direction)-\(roundedDistance)-\(remainingWaypoints.count)"
             if lastTurnAnnouncementKey != announcementKey {
                 speechEngine.speak(currentInstruction)
-                if turn == .left {
-                    hapticsEngine.playLeftTurn()
-                } else {
-                    hapticsEngine.playRightTurn()
-                }
                 lastTurnAnnouncementKey = announcementKey
             }
         } else {
@@ -320,16 +383,45 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
             )
         )
 
+        // Obstacle detection — uses pre-extracted mesh anchors, never holds ARFrame
         if let obstacleDetector,
-           let obstacleHit = obstacleDetector.detectObstacle(frame: frame),
+           let meshAnchors = snapshot.meshAnchors,
            Date().timeIntervalSince(lastObstacleAlertDate) > 2.0 {
-            lastObstacleAlertDate = Date()
-            obstacleMessage = String(format: "Obstacle ahead (%.1f m).", obstacleHit.forwardDistance)
-            speechEngine.speak("Obstacle ahead.")
-            hapticsEngine.playObstacleAlert()
+            let camTransform = snapshot.cameraTransform
+            let pixelBuffer = snapshot.pixelBuffer
+            let classifierLoaded = zeticClassifier.isModelLoaded
+            obstacleQueue.async { [weak self] in
+                guard let self else { return }
+                guard let hit = obstacleDetector.detectObstacle(
+                    cameraTransform: camTransform,
+                    meshAnchors: meshAnchors
+                ) else { return }
+
+                if classifierLoaded, let pixelBuffer {
+                    Task {
+                        let label = await self.zeticClassifier.classify(pixelBuffer: pixelBuffer)
+                        DispatchQueue.main.async {
+                            self.lastObstacleAlertDate = Date()
+                            if let label {
+                                self.obstacleMessage = String(format: "Caution: %@ ahead (%.1f m).", label.capitalized, hit.forwardDistance)
+                                self.speechEngine.speak("Caution: \(label) ahead.")
+                            } else {
+                                self.obstacleMessage = String(format: "Obstacle ahead (%.1f m).", hit.forwardDistance)
+                                self.speechEngine.speak("Obstacle ahead.")
+                            }
+                        }
+                    }
+                } else {
+                    DispatchQueue.main.async {
+                        self.lastObstacleAlertDate = Date()
+                        self.obstacleMessage = String(format: "Obstacle ahead (%.1f m).", hit.forwardDistance)
+                        self.speechEngine.speak("Obstacle ahead.")
+                    }
+                }
+            }
         } else if let obstacleMessage, Date().timeIntervalSince(lastObstacleAlertDate) > 2.5 {
             self.obstacleMessage = nil
-            if obstacleMessage.contains("Obstacle ahead") {
+            if obstacleMessage.contains("Obstacle ahead") || obstacleMessage.contains("Caution:") {
                 statusMessage = "Room aligned to the live camera feed."
             }
         }
@@ -619,9 +711,9 @@ struct RoomAnchoringView: View {
                             path: controller.renderedPath,
                             roomWorldTransform: roomTransform
                         )
-                        .frame(width: 140, height: 160)
-                        .padding(.trailing, 16)
-                        .padding(.bottom, 12)
+                        .frame(width: 120, height: 120)
+                        .padding(.trailing, 12)
+                        .padding(.bottom, 8)
                     }
                     .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
@@ -635,28 +727,20 @@ struct RoomAnchoringView: View {
     }
 
     private var topStatusPanel: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text(controller.isReady ? "Aligned Room" : "Aligning Room")
-                    .font(.headline)
+                Text(controller.isReady ? "Room Aligned" : "Aligning…")
+                    .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.white)
                 Spacer()
-
-                NavigationCompassView(heading: controller.trackerState.heading)
-
                 trackingBadge
             }
-
-            Text(controller.statusMessage)
-                .font(.subheadline)
-                .foregroundStyle(.white.opacity(0.9))
+            .accessibilityElement(children: .combine)
 
             if controller.isNavigationActive {
-                // Google-Maps-like stats HUD during active navigation
                 NavigationStatsHUD(
                     distanceRemaining: controller.distanceRemainingText,
                     distanceWalked: controller.trackerState.distanceWalked,
-                    stepsTaken: controller.trackerState.stepsTaken,
                     heading: controller.trackerState.heading,
                     startingPoint: controller.activeStartName ?? "Current Location",
                     destinationName: controller.activeDestinationName,
@@ -665,18 +749,9 @@ struct RoomAnchoringView: View {
                 )
             } else {
                 Text(controller.currentInstruction)
-                    .font(.title3.weight(.semibold))
+                    .font(.callout.weight(.semibold))
                     .foregroundStyle(.white)
-
-                if controller.isReady {
-                    // Show compact odometry when aligned but not navigating
-                    HStack(spacing: 16) {
-                        statusChip(title: "Walked", value: String(format: "%.1f m", controller.trackerState.distanceWalked))
-                        statusChip(title: "Steps", value: "\(controller.trackerState.stepsTaken)")
-                        statusChip(title: "Heading", value: "\(Int(controller.trackerState.heading))° \(CompassUtilities.directionString(for: controller.trackerState.heading))")
-                        statusChip(title: "Facing", value: controller.facingSurfaceName)
-                    }
-                }
+                    .accessibilityLabel(controller.currentInstruction)
             }
 
             if let obstacleMessage = controller.obstacleMessage {
@@ -684,44 +759,28 @@ struct RoomAnchoringView: View {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundStyle(.orange)
                     Text(obstacleMessage)
-                        .font(.subheadline.weight(.semibold))
+                        .font(.caption.weight(.semibold))
                         .foregroundStyle(.orange)
                 }
+                .accessibilityLabel(obstacleMessage)
             }
-
-            Text("Gold marks the saved starting point. Yellow arrows show the planned path on the floor.")
-                .font(.caption)
-                .foregroundStyle(.white.opacity(0.7))
         }
-        .padding(16)
-        .background(.black.opacity(0.84))
-        .clipShape(RoundedRectangle(cornerRadius: 18))
+        .padding(10)
+        .background(.black.opacity(0.78))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
         .overlay(
-            RoundedRectangle(cornerRadius: 18)
-                .stroke(Color.white.opacity(0.14), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
         )
     }
 
     private var bottomControlPanel: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            if let roomID = envelope.roomID {
-                Text("Room ID: \(roomID)")
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.white.opacity(0.68))
-                    .textSelection(.enabled)
-            }
-
-            if visualMeshURL != nil {
-                Text("Imported visual mesh attached")
-                    .font(.caption)
-                    .foregroundStyle(.green.opacity(0.92))
-            }
-
+        VStack(alignment: .leading, spacing: 10) {
             if controller.isReady {
-                // Conversational assistant replaces destination buttons
                 NavigationAssistantView(
                     messages: $controller.conversationMessages,
                     destinationNames: controller.destinationNames,
+                    roomContext: controller.roomContextSummary,
                     onNavigationRequested: { sourceName, destinationName in
                         controller.startNavigation(from: sourceName, to: destinationName)
                     },
@@ -732,43 +791,31 @@ struct RoomAnchoringView: View {
                 )
             } else {
                 Button(action: controller.alignUsingCurrentCameraPose) {
-                    Text("Align Here at Starting Point")
-                        .frame(maxWidth: .infinity, minHeight: 60)
+                    Text("Align Here")
+                        .frame(maxWidth: .infinity, minHeight: 44)
                 }
                 .buttonStyle(DotsPrimaryButtonStyle())
                 .disabled(!matchesReadyState)
+                .accessibilityLabel("Align room at current position")
+                .accessibilityHint("Stand at the starting point and tap to align the saved room model.")
             }
 
             Button(action: onRestart) {
-                Text("Choose Another Saved Model")
-                    .frame(maxWidth: .infinity, minHeight: 60)
+                Text("Switch Room")
+                    .frame(maxWidth: .infinity, minHeight: 40)
             }
             .buttonStyle(DotsSecondaryButtonStyle())
+            .accessibilityLabel("Switch to a different saved room model")
         }
-        .padding(16)
-        .background(.black.opacity(0.84))
-        .clipShape(RoundedRectangle(cornerRadius: 18))
+        .padding(10)
+        .background(.black.opacity(0.78))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
         .overlay(
-            RoundedRectangle(cornerRadius: 18)
-                .stroke(Color.white.opacity(0.14), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
         )
     }
 
-    private func statusChip(title: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title.uppercased())
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.white.opacity(0.55))
-            Text(value)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.white)
-                .lineLimit(2)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(Color.white.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-    }
 
     private var trackingBadge: some View {
         let label: String

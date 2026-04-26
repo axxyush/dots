@@ -119,10 +119,6 @@ struct ScanningView: View {
                             value: String(format: "%.1f m", scanManager.trackerState.distanceWalked)
                         )
                         scanStatChip(
-                            icon: "shoeprints.fill",
-                            value: "\(scanManager.trackerState.stepsTaken) steps"
-                        )
-                        scanStatChip(
                             icon: "location.north.fill",
                             value: "\(Int(scanManager.trackerState.heading))° \(CompassUtilities.directionString(for: scanManager.trackerState.heading))"
                         )
