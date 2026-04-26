@@ -9,8 +9,10 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
     @Published private(set) var isReady = false
     @Published private(set) var isNavigationActive = false
     @Published private(set) var destinationNames: [String] = []
+    @Published private(set) var activeStartName: String?
     @Published private(set) var activeDestinationName: String?
-    @Published var statusMessage = "Stand at the saved entry door and face into the room."
+    @Published private(set) var facingSurfaceName = "--"
+    @Published var statusMessage = "Stand at the saved starting point and face into the room."
     @Published var currentInstruction = "Align the saved plan to the live camera feed."
     @Published var distanceRemainingText = "--"
     @Published var obstacleMessage: String?
@@ -32,10 +34,10 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
     private var obstacleDetector: DynamicObstacleDetector?
     private let speechEngine = NavigationSpeechEngine()
     private let hapticsEngine = NavigationHapticsEngine()
-    private var currentCameraTransform: simd_float4x4?
     private var destinationWorldPoint: SIMD3<Float>?
-    private var remainingWaypoints: [SIMD3<Float>] = []
-    private var renderedPath: [SIMD3<Float>] = []
+    @Published private(set) var remainingWaypoints: [SIMD3<Float>] = []
+    @Published private(set) var renderedPath: [SIMD3<Float>] = []
+    @Published private(set) var currentCameraTransform: simd_float4x4?
     private var lastTurnAnnouncementKey: String?
     private var lastObstacleAlertDate = Date.distantPast
     private var lastRecalculationDate = Date.distantPast
@@ -97,19 +99,24 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
         navigator = RoomNavigator(snapshot: envelope.capturedRoomSnapshot, roomWorldTransform: roomTransform)
         obstacleDetector = DynamicObstacleDetector(envelope: envelope, roomWorldTransform: roomTransform)
         destinationNames = destinationResolver?.destinationNames ?? []
+        facingSurfaceName = facingSurfaceName(for: frame.camera.transform, roomWorldTransform: roomTransform)
 
         renderRoom(at: roomTransform)
         stopNavigation(resetInstruction: false)
     }
 
-    func startNavigation(to destinationName: String) {
+    @discardableResult
+    func startNavigation(from sourceName: String? = nil, to destinationName: String) -> NavigationRequestResult {
         guard
             isReady,
             let frame = arView?.session.currentFrame,
             let resolver = destinationResolver,
             let navigator
         else {
-            return
+            return NavigationRequestResult(
+                didStart: false,
+                response: "Align the saved room model before starting navigation."
+            )
         }
 
         let userPosition = RoomGeometry.translation(of: frame.camera.transform)
@@ -117,13 +124,46 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
 
         guard let candidate = resolver.resolveCandidate(destinationName) else {
             currentInstruction = "Could not find that destination in the saved room model."
-            return
+            return NavigationRequestResult(
+                didStart: false,
+                response: "I could not find \(destinationName) in this saved room."
+            )
+        }
+
+        var response = "I'll guide you to \(candidate.name). Walk forward and I'll give you directions."
+        activeStartName = "Current Location"
+
+        if let sourceName, !sourceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            guard let sourceCandidate = resolver.resolveCandidate(sourceName) else {
+                currentInstruction = "Could not find \(sourceName) in the saved room model."
+                return NavigationRequestResult(
+                    didStart: false,
+                    response: "I could not find \(sourceName) in this saved room."
+                )
+            }
+
+            let sourceDistance = NavigationGuidanceMath.planarDistance(userPosition, sourceCandidate.worldPosition)
+            if sourceDistance > 1.4 {
+                activeStartName = sourceCandidate.name
+                currentInstruction = "Move to \(sourceCandidate.name) to begin this route."
+                distanceRemainingText = "--"
+                return NavigationRequestResult(
+                    didStart: false,
+                    response: String(format: "You're %.1f meters away from %@. Move there first, then I'll guide you to %@.", sourceDistance, sourceCandidate.name, candidate.name)
+                )
+            }
+
+            activeStartName = sourceCandidate.name
+            response = "I'll guide you from \(sourceCandidate.name) to \(candidate.name). Walk forward and I'll give you directions."
         }
 
         let path = navigator.findPath(from: userPosition, to: candidate.worldPosition)
         guard !path.isEmpty else {
             currentInstruction = "Could not map a walkable route to \(candidate.name)."
-            return
+            return NavigationRequestResult(
+                didStart: false,
+                response: "I could not map a walkable route to \(candidate.name)."
+            )
         }
 
         activeDestinationName = candidate.name
@@ -143,11 +183,12 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
         )
 
         renderPath()
-        speechEngine.speak("Starting navigation to \(candidate.name). Walk forward.")
+        return NavigationRequestResult(didStart: true, response: response)
     }
 
     func stopNavigation(resetInstruction: Bool = true) {
         isNavigationActive = false
+        activeStartName = nil
         activeDestinationName = nil
         destinationWorldPoint = nil
         remainingWaypoints = []
@@ -197,6 +238,9 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
         let currentPosition = RoomGeometry.translation(of: frame.camera.transform)
         destinationResolver?.updateUserWorldPosition(currentPosition)
         statusMessage = "Room aligned to the live camera feed."
+        if let roomWorldTransform {
+            facingSurfaceName = facingSurfaceName(for: frame.camera.transform, roomWorldTransform: roomWorldTransform)
+        }
 
         if isNavigationActive {
             advanceNavigation(frame: frame, currentPosition: currentPosition)
@@ -423,6 +467,109 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
         }
     }
 
+    private func facingSurfaceName(
+        for cameraTransform: simd_float4x4,
+        roomWorldTransform: simd_float4x4
+    ) -> String {
+        let worldRoomTransform = roomWorldTransform.inverse
+        let cameraWorldPosition = RoomGeometry.translation(of: cameraTransform)
+        let roomPosition4 = worldRoomTransform * SIMD4<Float>(cameraWorldPosition.x, cameraWorldPosition.y, cameraWorldPosition.z, 1)
+        let roomPosition = SIMD2<Float>(roomPosition4.x, roomPosition4.z)
+
+        let forwardWorld = SIMD3<Float>(
+            -cameraTransform.columns.2.x,
+            0,
+            -cameraTransform.columns.2.z
+        )
+        let forwardRoom4 = worldRoomTransform * SIMD4<Float>(forwardWorld.x, 0, forwardWorld.z, 0)
+        let forwardRoom = SIMD2<Float>(forwardRoom4.x, forwardRoom4.z)
+        guard simd_length_squared(forwardRoom) > 0.0001 else {
+            return "--"
+        }
+
+        let rayDirection = simd_normalize(forwardRoom)
+        var bestHit: (distance: Float, priority: Int, label: String)?
+
+        for door in envelope.capturedRoomSnapshot.doors {
+            let label = RoomLabeling.displayName(for: door)
+            registerFacingHit(
+                from: roomPosition,
+                direction: rayDirection,
+                surface: door,
+                label: label,
+                priority: 0,
+                currentBest: &bestHit
+            )
+        }
+
+        for wall in envelope.capturedRoomSnapshot.walls {
+            let label = RoomLabeling.displayName(for: wall)
+            registerFacingHit(
+                from: roomPosition,
+                direction: rayDirection,
+                surface: wall,
+                label: label,
+                priority: 1,
+                currentBest: &bestHit
+            )
+        }
+
+        return bestHit?.label ?? CompassUtilities.directionString(for: trackerState.heading)
+    }
+
+    private func registerFacingHit(
+        from origin: SIMD2<Float>,
+        direction: SIMD2<Float>,
+        surface: SurfaceSnapshot,
+        label: String,
+        priority: Int,
+        currentBest: inout (distance: Float, priority: Int, label: String)?
+    ) {
+        let endpoints = RoomGeometry.surfaceEndpoints(
+            transform: surface.transformMatrix.simd,
+            width: surface.dimensionsMeters.x
+        )
+        let start = SIMD2<Float>(endpoints.0.x, endpoints.0.z)
+        let end = SIMD2<Float>(endpoints.1.x, endpoints.1.z)
+
+        guard let distance = rayIntersectionDistance(origin: origin, direction: direction, segmentStart: start, segmentEnd: end) else {
+            return
+        }
+
+        if let best = currentBest {
+            if distance < best.distance - 0.05 || (abs(distance - best.distance) <= 0.05 && priority < best.priority) {
+                currentBest = (distance, priority, label)
+            }
+        } else {
+            currentBest = (distance, priority, label)
+        }
+    }
+
+    private func rayIntersectionDistance(
+        origin: SIMD2<Float>,
+        direction: SIMD2<Float>,
+        segmentStart: SIMD2<Float>,
+        segmentEnd: SIMD2<Float>
+    ) -> Float? {
+        let segmentVector = segmentEnd - segmentStart
+        let denominator = cross2D(direction, segmentVector)
+        guard abs(denominator) > 0.0001 else { return nil }
+
+        let startDelta = segmentStart - origin
+        let rayDistance = cross2D(startDelta, segmentVector) / denominator
+        let segmentDistance = cross2D(startDelta, direction) / denominator
+
+        guard rayDistance >= 0, segmentDistance >= 0, segmentDistance <= 1 else {
+            return nil
+        }
+
+        return rayDistance
+    }
+
+    private func cross2D(_ lhs: SIMD2<Float>, _ rhs: SIMD2<Float>) -> Float {
+        lhs.x * rhs.y - lhs.y * rhs.x
+    }
+
     private func pathWithDestination(_ path: [SIMD3<Float>], destination: SIMD3<Float>) -> [SIMD3<Float>] {
         guard let last = path.last else { return [destination] }
         if NavigationGuidanceMath.planarDistance(last, destination) <= 0.25 {
@@ -461,12 +608,30 @@ struct RoomAnchoringView: View {
                     .padding(.horizontal)
 
                 Spacer()
+                
+                if controller.isNavigationActive, let currentCam = controller.currentCameraTransform, let roomTransform = controller.roomWorldTransform {
+                    HStack {
+                        Spacer()
+                        MiniMapView(
+                            snapshot: envelope.capturedRoomSnapshot,
+                            currentPosition: RoomGeometry.translation(of: currentCam),
+                            currentCameraTransform: currentCam,
+                            path: controller.renderedPath,
+                            roomWorldTransform: roomTransform
+                        )
+                        .frame(width: 140, height: 160)
+                        .padding(.trailing, 16)
+                        .padding(.bottom, 12)
+                    }
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+                }
 
                 bottomControlPanel
                     .padding(.horizontal)
                     .padding(.bottom)
             }
         }
+        .animation(.easeInOut(duration: 0.3), value: controller.isNavigationActive)
     }
 
     private var topStatusPanel: some View {
@@ -493,9 +658,10 @@ struct RoomAnchoringView: View {
                     distanceWalked: controller.trackerState.distanceWalked,
                     stepsTaken: controller.trackerState.stepsTaken,
                     heading: controller.trackerState.heading,
-                    startingPoint: "Entry Door",
+                    startingPoint: controller.activeStartName ?? "Current Location",
                     destinationName: controller.activeDestinationName,
-                    instruction: controller.currentInstruction
+                    instruction: controller.currentInstruction,
+                    facingText: controller.facingSurfaceName
                 )
             } else {
                 Text(controller.currentInstruction)
@@ -508,6 +674,7 @@ struct RoomAnchoringView: View {
                         statusChip(title: "Walked", value: String(format: "%.1f m", controller.trackerState.distanceWalked))
                         statusChip(title: "Steps", value: "\(controller.trackerState.stepsTaken)")
                         statusChip(title: "Heading", value: "\(Int(controller.trackerState.heading))° \(CompassUtilities.directionString(for: controller.trackerState.heading))")
+                        statusChip(title: "Facing", value: controller.facingSurfaceName)
                     }
                 }
             }
@@ -522,7 +689,7 @@ struct RoomAnchoringView: View {
                 }
             }
 
-            Text("Gold marks the saved entry door. Yellow arrows show the planned path on the floor.")
+            Text("Gold marks the saved starting point. Yellow arrows show the planned path on the floor.")
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.7))
         }
@@ -555,8 +722,8 @@ struct RoomAnchoringView: View {
                 NavigationAssistantView(
                     messages: $controller.conversationMessages,
                     destinationNames: controller.destinationNames,
-                    onDestinationChosen: { name in
-                        controller.startNavigation(to: name)
+                    onNavigationRequested: { sourceName, destinationName in
+                        controller.startNavigation(from: sourceName, to: destinationName)
                     },
                     onStopNavigation: {
                         controller.stopNavigation()
@@ -565,7 +732,7 @@ struct RoomAnchoringView: View {
                 )
             } else {
                 Button(action: controller.alignUsingCurrentCameraPose) {
-                    Text("Align Here at Entry")
+                    Text("Align Here at Starting Point")
                         .frame(maxWidth: .infinity, minHeight: 60)
                 }
                 .buttonStyle(DotsPrimaryButtonStyle())

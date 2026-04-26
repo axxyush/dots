@@ -167,6 +167,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				BDA0F00100000000000000B1 /* XCRemoteSwiftPackageReference "elevenlabs-swift-sdk" */,
+				D77431032F9DA49A00397F59 /* XCRemoteSwiftPackageReference "ZeticMLangeiOS" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = BDA0C76A2F907748007DD6AF /* Products */;
@@ -495,6 +496,14 @@
 			requirement = {
 				kind = upToNextMajorVersion;
 				minimumVersion = 3.1.4;
+			};
+		};
+		D77431032F9DA49A00397F59 /* XCRemoteSwiftPackageReference "ZeticMLangeiOS" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/zetic-ai/ZeticMLangeiOS.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.6.0;
 			};
 		};
 /* End XCRemoteSwiftPackageReference section */

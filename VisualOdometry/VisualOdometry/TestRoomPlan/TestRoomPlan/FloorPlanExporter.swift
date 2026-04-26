@@ -10,8 +10,11 @@ struct FloorPlanMetadata: Codable {
     let compassHeadingAtScan: Double?
     let roomWidthMeters: Float
     let roomDepthMeters: Float
-    let entryDoorIndex: Int
+    let entryDoorIndex: Int? // Maintained for backward compatibility
+    let anchorType: String?
+    let anchorIndex: Int?
     let wallBearings: [WallBearing]
+    let doorPositions: [DoorPosition]?
     let objectPositions: [ObjectPosition]
     let savedAt: String
 
@@ -24,9 +27,18 @@ struct FloorPlanMetadata: Codable {
         let bearingDegrees: Double
     }
 
+    struct DoorPosition: Codable {
+        let index: Int
+        let label: String?
+        let roomX: Float
+        let roomZ: Float
+        let widthMeters: Float
+    }
+
     struct ObjectPosition: Codable {
         let index: Int
         let category: String
+        let label: String?
         let roomX: Float
         let roomZ: Float
         let widthMeters: Float
@@ -44,11 +56,15 @@ enum FloorPlanExporter {
     @MainActor
     static func renderFloorPlanImage(
         capturedRoom: CapturedRoom,
-        selectedDoorIndex: Int?
+        selectedAnchor: SelectedAnchor?,
+        doorLabelOverrides: [Int: String] = [:],
+        objectLabelOverrides: [Int: String] = [:]
     ) -> UIImage? {
         let planView = FloorPlanView(
             capturedRoom: capturedRoom,
-            selectedDoorIndex: selectedDoorIndex
+            selectedAnchor: selectedAnchor,
+            doorLabelOverrides: doorLabelOverrides,
+            objectLabelOverrides: objectLabelOverrides
         )
         .frame(width: 800, height: 800)
         .background(Color.white)
@@ -62,8 +78,10 @@ enum FloorPlanExporter {
     static func buildMetadata(
         capturedRoom: CapturedRoom,
         roomID: String,
-        entryDoorIndex: Int,
-        compassHeading: Double? = nil
+        selectedAnchor: SelectedAnchor,
+        compassHeading: Double? = nil,
+        doorLabelOverrides: [Int: String] = [:],
+        objectLabelOverrides: [Int: String] = [:]
     ) -> FloorPlanMetadata {
         let wallBearings: [FloorPlanMetadata.WallBearing] = capturedRoom.walls.enumerated().map { index, wall in
             let (a, b) = RoomGeometry.surfaceEndpoints(transform: wall.transform, width: wall.dimensions.x)
@@ -82,11 +100,24 @@ enum FloorPlanExporter {
             )
         }
 
+        let doorPositions: [FloorPlanMetadata.DoorPosition] = capturedRoom.doors.enumerated().map { index, door in
+            let position = RoomGeometry.translation(of: door.transform)
+            return FloorPlanMetadata.DoorPosition(
+                index: index,
+                label: RoomLabeling.sanitizedOverride(doorLabelOverrides[index]) ?? RoomLabeling.defaultSurfaceLabel(category: "door", index: index),
+                roomX: position.x,
+                roomZ: position.z,
+                widthMeters: door.dimensions.x
+            )
+        }
+
         let objectPositions: [FloorPlanMetadata.ObjectPosition] = capturedRoom.objects.enumerated().map { index, obj in
             let pos = RoomGeometry.translation(of: obj.transform)
+            let category = RoomExporter.objectCategoryName(obj.category)
             return FloorPlanMetadata.ObjectPosition(
                 index: index,
-                category: RoomExporter.objectCategoryName(obj.category),
+                category: category,
+                label: RoomLabeling.sanitizedOverride(objectLabelOverrides[index]) ?? RoomLabeling.defaultObjectLabel(category: category, index: index),
                 roomX: pos.x,
                 roomZ: pos.z,
                 widthMeters: obj.dimensions.x,
@@ -98,13 +129,30 @@ enum FloorPlanExporter {
 
         let formatter = ISO8601DateFormatter()
 
+        let doorIndex: Int?
+        let anchorIndex: Int?
+        let anchorType: String?
+        switch selectedAnchor {
+        case .door(let index):
+            doorIndex = index
+            anchorIndex = index
+            anchorType = "door"
+        case .object(let index):
+            doorIndex = nil
+            anchorIndex = index
+            anchorType = "object"
+        }
+
         return FloorPlanMetadata(
             roomID: roomID,
             compassHeadingAtScan: compassHeading,
             roomWidthMeters: Float(roomWidth),
             roomDepthMeters: Float(roomDepth),
-            entryDoorIndex: entryDoorIndex,
+            entryDoorIndex: doorIndex,
+            anchorType: anchorType,
+            anchorIndex: anchorIndex,
             wallBearings: wallBearings,
+            doorPositions: doorPositions,
             objectPositions: objectPositions,
             savedAt: formatter.string(from: Date())
         )

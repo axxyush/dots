@@ -9,6 +9,11 @@ struct ConversationMessage: Identifiable, Equatable {
     let text: String
 }
 
+struct NavigationRequestResult: Equatable {
+    let didStart: Bool
+    let response: String
+}
+
 // MARK: - Compass View
 
 struct NavigationCompassView: View {
@@ -47,6 +52,7 @@ struct NavigationStatsHUD: View {
     let startingPoint: String
     let destinationName: String?
     let instruction: String
+    let facingText: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -85,6 +91,10 @@ struct NavigationStatsHUD: View {
             .padding(.vertical, 6)
             .background(Color.white.opacity(0.06))
             .clipShape(Capsule())
+
+            Text("Facing \(facingText)")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.white.opacity(0.72))
 
             // Stats row
             HStack(spacing: 16) {
@@ -129,7 +139,7 @@ struct NavigationStatsHUD: View {
 struct NavigationAssistantView: View {
     @Binding var messages: [ConversationMessage]
     let destinationNames: [String]
-    let onDestinationChosen: (String) -> Void
+    let onNavigationRequested: (_ sourceName: String?, _ destinationName: String) -> NavigationRequestResult
     let onStopNavigation: () -> Void
     let isNavigationActive: Bool
 
@@ -310,54 +320,66 @@ struct NavigationAssistantView: View {
 
     private func chooseDestination(_ name: String) {
         messages.append(ConversationMessage(role: .user, text: "Take me to \(name)"))
-        let response = "I'll guide you to \(name). Walk forward and I'll give you directions."
-        messages.append(ConversationMessage(role: .assistant, text: response))
-        speechEngine.speak(response)
-        onDestinationChosen(name)
+        sendNavigationRequest(sourceName: nil, destinationName: name)
     }
 
     private func parseAndNavigate(_ text: String) {
-        // Try to match against known destinations
-        let lowerText = text.lowercased()
-
-        // Check each destination name for a fuzzy match
-        for name in destinationNames {
-            let lowerName = name.lowercased()
-            if lowerText.contains(lowerName) {
-                chooseDestinationFromParse(name)
-                return
-            }
+        if let route = parseExplicitRoute(text) {
+            sendNavigationRequest(sourceName: route.source, destinationName: route.destination)
+            return
         }
 
-        // Try common synonyms
-        let synonymMap: [(keywords: [String], destination: String)] = [
-            (["bathroom", "restroom", "toilet", "washroom", "bath"], "Bathroom"),
-            (["bed", "bedroom", "sleep"], "Bed"),
-            (["seat", "chair", "table", "sit", "seating", "lounge", "dining"], "Seating Area"),
-            (["exit", "door", "entrance", "entry", "front door", "out", "leave"], "Exit"),
-        ]
+        sendNavigationRequest(sourceName: nil, destinationName: text)
+    }
 
-        for mapping in synonymMap {
-            if mapping.keywords.contains(where: { lowerText.contains($0) }) {
-                if destinationNames.contains(mapping.destination) {
-                    chooseDestinationFromParse(mapping.destination)
-                    return
-                }
-            }
+    private func sendNavigationRequest(sourceName: String?, destinationName: String) {
+        let result = onNavigationRequested(sourceName, destinationName)
+        var response = result.response
+
+        if !result.didStart,
+           !destinationNames.isEmpty,
+           !response.contains("Available places"),
+           response.lowercased().contains("could not find") {
+            let available = destinationNames.joined(separator: ", ")
+            response += " Available places are: \(available)."
         }
 
-        // No match found
-        let available = destinationNames.joined(separator: ", ")
-        let response = "I couldn't find that destination. Available places are: \(available). Where would you like to go?"
         messages.append(ConversationMessage(role: .assistant, text: response))
         speechEngine.speak(response)
     }
 
-    private func chooseDestinationFromParse(_ name: String) {
-        let response = "I'll guide you to \(name). Walk forward and I'll give you directions."
-        messages.append(ConversationMessage(role: .assistant, text: response))
-        speechEngine.speak(response)
-        onDestinationChosen(name)
+    private func parseExplicitRoute(_ text: String) -> (source: String, destination: String)? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let arrowParts = trimmed.components(separatedBy: "->").map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if arrowParts.count == 2, !arrowParts[0].isEmpty, !arrowParts[1].isEmpty {
+            return (arrowParts[0], arrowParts[1])
+        }
+
+        let lowered = trimmed.lowercased()
+        guard
+            let fromRange = lowered.range(of: "from "),
+            let toRange = lowered.range(of: " to ", range: fromRange.upperBound..<lowered.endIndex)
+        else {
+            return nil
+        }
+
+        let sourceStartOffset = lowered.distance(from: lowered.startIndex, to: fromRange.upperBound)
+        let sourceEndOffset = lowered.distance(from: lowered.startIndex, to: toRange.lowerBound)
+        let destinationStartOffset = lowered.distance(from: lowered.startIndex, to: toRange.upperBound)
+
+        let sourceStart = trimmed.index(trimmed.startIndex, offsetBy: sourceStartOffset)
+        let sourceEnd = trimmed.index(trimmed.startIndex, offsetBy: sourceEndOffset)
+        let destinationStart = trimmed.index(trimmed.startIndex, offsetBy: destinationStartOffset)
+
+        let source = String(trimmed[sourceStart..<sourceEnd]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let destination = String(trimmed[destinationStart...]).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !source.isEmpty, !destination.isEmpty else { return nil }
+        return (source, destination)
     }
 
     // MARK: - Bubble

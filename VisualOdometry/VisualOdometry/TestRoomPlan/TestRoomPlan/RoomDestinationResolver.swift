@@ -1,9 +1,17 @@
 import Foundation
 import simd
 
+enum DestinationKind: Equatable {
+    case zone
+    case door(index: Int, isEntry: Bool)
+    case object(index: Int)
+}
+
 struct DestinationCandidate: Identifiable, Equatable {
     let id: UUID
     let name: String
+    let aliases: [String]
+    let kind: DestinationKind
     let roomPosition: SIMD3<Float>
     let worldPosition: SIMD3<Float>
 }
@@ -25,15 +33,10 @@ final class RoomDestinationResolver {
     }
 
     var destinationNames: [String] {
-        let preferredOrder = ["Bathroom", "Seating Area", "Bed", "Exit"]
-        let unique = Array(Set(candidates.map(\.name)))
-        return unique.sorted { left, right in
-            let leftIndex = preferredOrder.firstIndex(of: left) ?? preferredOrder.count
-            let rightIndex = preferredOrder.firstIndex(of: right) ?? preferredOrder.count
-            if leftIndex == rightIndex {
-                return left < right
-            }
-            return leftIndex < rightIndex
+        var seen: Set<String> = []
+        return orderedCandidates.compactMap { candidate in
+            guard seen.insert(candidate.name).inserted else { return nil }
+            return candidate.name
         }
     }
 
@@ -46,46 +49,99 @@ final class RoomDestinationResolver {
     }
 
     func resolveCandidate(_ query: String) -> DestinationCandidate? {
-        let normalized = query
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-
+        let normalized = Self.normalizedSearchKey(query)
         guard !normalized.isEmpty else { return nil }
 
-        let matchingNames = destinationNames.filter { name in
-            let canonical = name.lowercased()
-            if canonical.contains(normalized) || normalized.contains(canonical) {
-                return true
-            }
+        if let directDoor = resolveDoorCandidate(query, normalized: normalized) {
+            return directDoor
+        }
 
-            switch canonical {
-            case "bathroom":
-                return ["bathroom", "restroom", "toilet", "sink", "bath", "washroom"].contains(where: normalized.contains)
-            case "seating area":
-                return ["seat", "seating", "chair", "table", "lounge"].contains(where: normalized.contains)
-            case "bed":
-                return ["bed", "sleep"].contains(where: normalized.contains)
-            case "exit":
-                return ["exit", "door", "entrance", "entry"].contains(where: normalized.contains)
-            default:
+        if Self.isExitQuery(normalized), let entryDoor = orderedCandidates.first(where: isEntryDoor(_:)) {
+            return entryDoor
+        }
+
+        let pool = orderedCandidates.filter { candidate in
+            candidate.aliases.contains { alias in
+                let normalizedAlias = Self.normalizedSearchKey(alias)
+                return normalizedAlias.contains(normalized) || normalized.contains(normalizedAlias)
+            }
+        }
+
+        if !pool.isEmpty {
+            return preferredCandidate(from: pool)
+        }
+
+        let fallbackPool = orderedCandidates.filter { candidate in
+            let candidateWords = candidate.name.lowercased().split(separator: " ").map(String.init)
+            return candidateWords.contains { normalized.contains(Self.normalizedSearchKey($0)) }
+        }
+
+        guard !fallbackPool.isEmpty else { return nil }
+        return preferredCandidate(from: fallbackPool)
+    }
+
+    private var orderedCandidates: [DestinationCandidate] {
+        candidates.sorted { left, right in
+            let leftRank = Self.sortRank(for: left)
+            let rightRank = Self.sortRank(for: right)
+            if leftRank != rightRank {
+                return leftRank < rightRank
+            }
+            return left.name.localizedCaseInsensitiveCompare(right.name) == .orderedAscending
+        }
+    }
+
+    private func preferredCandidate(from pool: [DestinationCandidate]) -> DestinationCandidate? {
+        if let userPosition = currentUserWorldPosition {
+            return pool.min {
+                simd_distance($0.worldPosition, userPosition) < simd_distance($1.worldPosition, userPosition)
+            }
+        }
+        return pool.sorted {
+            let leftRank = Self.sortRank(for: $0)
+            let rightRank = Self.sortRank(for: $1)
+            if leftRank != rightRank {
+                return leftRank < rightRank
+            }
+            return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }.first
+    }
+
+    private func resolveDoorCandidate(_ rawQuery: String, normalized: String) -> DestinationCandidate? {
+        guard normalized.contains("door") else { return nil }
+
+        let matches = orderedCandidates.filter { candidate in
+            if case .door = candidate.kind {
+                let candidateKey = Self.normalizedSearchKey(candidate.name)
+                return normalized.contains(candidateKey) || candidate.aliases.contains {
+                    normalized.contains(Self.normalizedSearchKey($0))
+                }
+            }
+            return false
+        }
+
+        if !matches.isEmpty {
+            return preferredCandidate(from: matches)
+        }
+
+        let digits = rawQuery.filter(\.isNumber)
+        if let number = Int(digits), number > 0 {
+            return orderedCandidates.first { candidate in
+                if case .door(let index, _) = candidate.kind {
+                    return index + 1 == number
+                }
                 return false
             }
         }
 
-        let pool: [DestinationCandidate]
-        if matchingNames.isEmpty {
-            pool = candidates
-        } else {
-            pool = candidates.filter { matchingNames.contains($0.name) }
+        return nil
+    }
+
+    private func isEntryDoor(_ candidate: DestinationCandidate) -> Bool {
+        if case .door(_, let isEntry) = candidate.kind {
+            return isEntry
         }
-
-        guard !pool.isEmpty else { return nil }
-
-        if let userPosition = currentUserWorldPosition {
-            return pool.min { simd_distance($0.worldPosition, userPosition) < simd_distance($1.worldPosition, userPosition) }
-        }
-
-        return pool.first
+        return false
     }
 
     private static func buildCandidates(
@@ -93,11 +149,17 @@ final class RoomDestinationResolver {
         entryAnchor: EntryAnchorSnapshot,
         roomWorldTransform: simd_float4x4
     ) -> [DestinationCandidate] {
-        let objects = snapshot.objects.map { object -> (category: String, roomPosition: SIMD3<Float>) in
-            (object.category.lowercased(), RoomGeometry.translation(of: object.transformMatrix.simd))
-        }
-
+        let entryDoorIndex = resolvedEntryDoorIndex(snapshot: snapshot, entryAnchor: entryAnchor)
         var results: [DestinationCandidate] = []
+
+        let objects = snapshot.objects.map { object -> (index: Int, category: String, label: String, roomPosition: SIMD3<Float>) in
+            (
+                index: object.index,
+                category: object.category.lowercased(),
+                label: RoomLabeling.displayName(for: object),
+                roomPosition: RoomGeometry.translation(of: object.transformMatrix.simd)
+            )
+        }
 
         let bathroomObjects = objects.filter { ["toilet", "bathtub", "sink"].contains($0.category) }
         for cluster in clustered(items: bathroomObjects, threshold: 1.8) where !cluster.isEmpty {
@@ -106,6 +168,8 @@ final class RoomDestinationResolver {
                 DestinationCandidate(
                     id: UUID(),
                     name: "Bathroom",
+                    aliases: ["bathroom", "restroom", "toilet", "sink", "bath", "washroom"],
+                    kind: .zone,
                     roomPosition: center,
                     worldPosition: transform(center, by: roomWorldTransform)
                 )
@@ -122,6 +186,8 @@ final class RoomDestinationResolver {
                 DestinationCandidate(
                     id: UUID(),
                     name: "Seating Area",
+                    aliases: ["seat", "seating", "chair", "table", "lounge", "dining"],
+                    kind: .zone,
                     roomPosition: center,
                     worldPosition: transform(center, by: roomWorldTransform)
                 )
@@ -133,23 +199,84 @@ final class RoomDestinationResolver {
                 DestinationCandidate(
                     id: UUID(),
                     name: "Bed",
+                    aliases: ["bed", "sleep", bed.label],
+                    kind: .zone,
                     roomPosition: bed.roomPosition,
                     worldPosition: transform(bed.roomPosition, by: roomWorldTransform)
                 )
             )
         }
 
-        let exitPosition = entryAnchor.positionMeters.simd
-        results.append(
-            DestinationCandidate(
-                id: UUID(),
-                name: "Exit",
-                roomPosition: exitPosition,
-                worldPosition: transform(exitPosition, by: roomWorldTransform)
+        for door in snapshot.doors {
+            let center = RoomGeometry.translation(of: door.transformMatrix.simd)
+            let isEntry = door.index == entryDoorIndex
+            let label = RoomLabeling.displayName(for: door)
+            var aliases = [
+                label,
+                "door \(door.index + 1)",
+                "door\(door.index + 1)"
+            ]
+            if isEntry {
+                aliases += ["entry", "entry door", "front door", "exit", "entrance"]
+            }
+
+            results.append(
+                DestinationCandidate(
+                    id: UUID(),
+                    name: label,
+                    aliases: aliases,
+                    kind: .door(index: door.index, isEntry: isEntry),
+                    roomPosition: center,
+                    worldPosition: transform(center, by: roomWorldTransform)
+                )
             )
-        )
+        }
+
+        for object in objects {
+            results.append(
+                DestinationCandidate(
+                    id: UUID(),
+                    name: object.label,
+                    aliases: [object.label, object.category, "\(object.category) \(object.index + 1)"],
+                    kind: .object(index: object.index),
+                    roomPosition: object.roomPosition,
+                    worldPosition: transform(object.roomPosition, by: roomWorldTransform)
+                )
+            )
+        }
+
+        if snapshot.doors.isEmpty {
+            let exitPosition = entryAnchor.positionMeters.simd
+            results.append(
+                DestinationCandidate(
+                    id: UUID(),
+                    name: "Exit",
+                    aliases: ["exit", "door", "entrance", "entry", "front door", "out", "leave"],
+                    kind: .zone,
+                    roomPosition: exitPosition,
+                    worldPosition: transform(exitPosition, by: roomWorldTransform)
+                )
+            )
+        }
 
         return results
+    }
+
+    private static func resolvedEntryDoorIndex(
+        snapshot: CapturedRoomSnapshot,
+        entryAnchor: EntryAnchorSnapshot
+    ) -> Int? {
+        if let doorIndex = entryAnchor.doorIndex, snapshot.doors.contains(where: { $0.index == doorIndex }) {
+            return doorIndex
+        }
+
+        guard !snapshot.doors.isEmpty else { return nil }
+        let anchorPosition = entryAnchor.positionMeters.simd
+        return snapshot.doors.min {
+            let left = RoomGeometry.translation(of: $0.transformMatrix.simd)
+            let right = RoomGeometry.translation(of: $1.transformMatrix.simd)
+            return simd_distance(left, anchorPosition) < simd_distance(right, anchorPosition)
+        }?.index
     }
 
     private static func transform(_ point: SIMD3<Float>, by matrix: simd_float4x4) -> SIMD3<Float> {
@@ -164,13 +291,13 @@ final class RoomDestinationResolver {
     }
 
     private static func clustered(
-        items: [(category: String, roomPosition: SIMD3<Float>)],
+        items: [(index: Int, category: String, label: String, roomPosition: SIMD3<Float>)],
         threshold: Float
-    ) -> [[(category: String, roomPosition: SIMD3<Float>)]] {
+    ) -> [[(index: Int, category: String, label: String, roomPosition: SIMD3<Float>)]] {
         guard !items.isEmpty else { return [] }
 
         var remaining = Set(items.indices)
-        var clusters: [[(category: String, roomPosition: SIMD3<Float>)]] = []
+        var clusters: [[(index: Int, category: String, label: String, roomPosition: SIMD3<Float>)]] = []
 
         while let seed = remaining.first {
             var queue = [seed]
@@ -195,5 +322,37 @@ final class RoomDestinationResolver {
         }
 
         return clusters
+    }
+
+    private static func sortRank(for candidate: DestinationCandidate) -> Int {
+        switch candidate.kind {
+        case .zone:
+            switch candidate.name {
+            case "Bathroom": return 0
+            case "Seating Area": return 1
+            case "Bed": return 2
+            case "Exit": return 3
+            default: return 4
+            }
+        case .door(let index, _):
+            return 10 + index
+        case .object(let index):
+            return 100 + index
+        }
+    }
+
+    private static func normalizedSearchKey(_ value: String) -> String {
+        value
+            .lowercased()
+            .unicodeScalars
+            .filter { CharacterSet.alphanumerics.contains($0) }
+            .map(String.init)
+            .joined()
+    }
+
+    private static func isExitQuery(_ normalizedQuery: String) -> Bool {
+        ["exit", "door", "entrance", "entry", "frontdoor", "out", "leave"].contains {
+            normalizedQuery.contains($0)
+        }
     }
 }

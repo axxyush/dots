@@ -74,7 +74,9 @@ struct MarkerSnapshot: Codable, Equatable {
 }
 
 struct EntryAnchorSnapshot: Codable, Equatable {
-    let doorIndex: Int
+    let doorIndex: Int? // Kept optional for backward compatibility
+    let anchorType: String? // e.g. "door" or "object"
+    let anchorIndex: Int? // Generic index in the respective array
     let transformMatrix: TransformMatrixData
     let positionMeters: Vector3Data
 }
@@ -82,6 +84,7 @@ struct EntryAnchorSnapshot: Codable, Equatable {
 struct SurfaceSnapshot: Codable, Equatable, Identifiable {
     let index: Int
     let category: String
+    let label: String?
     let dimensionsMeters: Vector3Data
     let transformMatrix: TransformMatrixData
 
@@ -91,6 +94,7 @@ struct SurfaceSnapshot: Codable, Equatable, Identifiable {
 struct ObjectSnapshot: Codable, Equatable, Identifiable {
     let index: Int
     let category: String
+    let label: String?
     let dimensionsMeters: Vector3Data
     let transformMatrix: TransformMatrixData
     let confidence: String?
@@ -146,5 +150,41 @@ struct RoomModelUploadResponse: Decodable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case roomID = "roomId"
+    }
+}
+
+enum RoomLabeling {
+    static func sanitizedOverride(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    static func defaultSurfaceLabel(category: String, index: Int) -> String {
+        switch category.lowercased() {
+        case "door":
+            return "Door \(index + 1)"
+        case "window":
+            return "Window \(index + 1)"
+        case "wall":
+            return "Wall \(index + 1)"
+        default:
+            let title = category.isEmpty ? "Surface" : category.capitalized
+            return "\(title) \(index + 1)"
+        }
+    }
+
+    static func defaultObjectLabel(category: String, index: Int) -> String {
+        let title = category.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedTitle = title.isEmpty ? "Object" : title
+        return "\(resolvedTitle) \(index + 1)"
+    }
+
+    static func displayName(for surface: SurfaceSnapshot) -> String {
+        sanitizedOverride(surface.label) ?? defaultSurfaceLabel(category: surface.category, index: surface.index)
+    }
+
+    static func displayName(for object: ObjectSnapshot) -> String {
+        sanitizedOverride(object.label) ?? defaultObjectLabel(category: object.category, index: object.index)
     }
 }

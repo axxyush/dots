@@ -97,6 +97,8 @@ private struct RoomModelEnvelopeResponse: Decodable {
             ),
             entryAnchor: EntryAnchorSnapshot(
                 doorIndex: 0,
+                anchorType: "door",
+                anchorIndex: 0,
                 transformMatrix: TransformMatrixData(matrix_identity_float4x4),
                 positionMeters: Vector3Data(x: 0, y: 0, z: 0)
             ),

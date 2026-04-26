@@ -48,7 +48,7 @@ enum RoomModelVisualization {
             RoomVisualizationElement(
                 id: "wall-\(surface.index)",
                 kind: .wall,
-                label: "Wall \(surface.index + 1)",
+                label: RoomLabeling.displayName(for: surface),
                 transform: surface.transformMatrix.simd,
                 dimensions: RoomGeometry.renderableSurfaceDimensions(
                     from: surface.dimensionsMeters.simd
@@ -57,10 +57,11 @@ enum RoomModelVisualization {
         }
 
         elements += snapshot.doors.map { surface in
-            RoomVisualizationElement(
+            let baseLabel = RoomLabeling.displayName(for: surface)
+            return RoomVisualizationElement(
                 id: "door-\(surface.index)",
                 kind: .door(isEntry: surface.index == envelope.entryAnchor.doorIndex),
-                label: surface.index == envelope.entryAnchor.doorIndex ? "Entry Door" : "Door \(surface.index + 1)",
+                label: surface.index == envelope.entryAnchor.doorIndex ? "Entry Door (\(baseLabel))" : baseLabel,
                 transform: surface.transformMatrix.simd,
                 dimensions: RoomGeometry.renderableSurfaceDimensions(
                     from: surface.dimensionsMeters.simd,
@@ -73,7 +74,7 @@ enum RoomModelVisualization {
             RoomVisualizationElement(
                 id: "window-\(surface.index)",
                 kind: .window,
-                label: "Window \(surface.index + 1)",
+                label: RoomLabeling.displayName(for: surface),
                 transform: surface.transformMatrix.simd,
                 dimensions: RoomGeometry.renderableSurfaceDimensions(
                     from: surface.dimensionsMeters.simd,
@@ -86,7 +87,7 @@ enum RoomModelVisualization {
             RoomVisualizationElement(
                 id: "object-\(object.index)",
                 kind: .object(category: object.category),
-                label: object.category.capitalized,
+                label: RoomLabeling.displayName(for: object),
                 transform: object.transformMatrix.simd,
                 dimensions: RoomGeometry.renderableObjectDimensions(
                     from: object.dimensionsMeters.simd

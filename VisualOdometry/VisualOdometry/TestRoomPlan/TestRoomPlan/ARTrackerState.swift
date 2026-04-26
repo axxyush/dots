@@ -28,17 +28,21 @@ final class ARTrackerProcessor {
 
     // Distance tracking
     private var previousPosition: SIMD3<Float>?
+    private var totalPlanarDistance: Float = 0.0
 
     // Step detection (vertical Y-axis peak detection)
     private var smoothedY: Float?
     private var isGoingUp: Bool = true
     private var lastPeakY: Float = 0.0
     private var lastTroughY: Float = 0.0
+    private var bobDetectedSteps: Int = 0
 
     /// Vertical bobbing threshold to register a step (~2–5 cm for normal walking)
     private let stepThreshold: Float = 0.02
     /// Hysteresis to prevent rapid direction flipping from jitter
     private let hysteresis: Float = 0.005
+    /// Average stride length used to convert tracked translation into a stable step count.
+    private let estimatedStrideLengthMeters: Float = 0.68
 
     init(state: ARTrackerState) {
         self.state = state
@@ -67,6 +71,7 @@ final class ARTrackerProcessor {
         if let prevPos = previousPosition {
             let delta = currentPos - prevPos
             let distanceMoved = length(delta)
+            let planarDistanceMoved = simd_length(SIMD2<Float>(delta.x, delta.z))
 
             // Ignore jitter below 5mm
             if distanceMoved > 0.005 {
@@ -80,6 +85,8 @@ final class ARTrackerProcessor {
                 let directionSign: Float = dotProduct < 0 ? -1.0 : 1.0
 
                 state.distanceWalked += (distanceMoved * directionSign)
+                totalPlanarDistance += planarDistanceMoved
+                updateStepCountFromDistance()
                 previousPosition = currentPos
             }
         } else {
@@ -102,10 +109,12 @@ final class ARTrackerProcessor {
     /// Resets position tracking (e.g., on re-alignment). Does not reset distance/steps.
     func resetPositionTracking() {
         previousPosition = nil
+        totalPlanarDistance = 0.0
         smoothedY = nil
         isGoingUp = true
         lastPeakY = 0.0
         lastTroughY = 0.0
+        bobDetectedSteps = 0
     }
 
     // MARK: - Step Detection
@@ -131,9 +140,8 @@ final class ARTrackerProcessor {
 
                 let motionAmplitude = lastPeakY - lastTroughY
                 if motionAmplitude > stepThreshold {
-                    Task { @MainActor in
-                        state.stepsTaken += 1
-                    }
+                    bobDetectedSteps += 1
+                    updateStepCountFromDistance()
                 }
 
                 lastTroughY = newSmoothedY
@@ -147,6 +155,11 @@ final class ARTrackerProcessor {
                 lastPeakY = newSmoothedY
             }
         }
+    }
+
+    private func updateStepCountFromDistance() {
+        let distanceEstimatedSteps = Int(floor(totalPlanarDistance / estimatedStrideLengthMeters))
+        state.stepsTaken = max(bobDetectedSteps, distanceEstimatedSteps)
     }
 }
 
