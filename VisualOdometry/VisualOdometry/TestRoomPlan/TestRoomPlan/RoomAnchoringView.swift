@@ -31,19 +31,23 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
     private var guideAnchor: AnchorEntity?
     private var destinationResolver: RoomDestinationResolver?
     private var navigator: RoomNavigator?
-    private var obstacleDetector: DynamicObstacleDetector?
-    private let speechEngine = NavigationSpeechEngine()
+    private let obstacleDetector = BackendVisionClassifier()
+    private let speechEngine = NavigationSpeechEngine.shared
     private var lastNavigationUpdateDate = Date.distantPast
     private var lastPathRenderDate = Date.distantPast
-    private let obstacleQueue = DispatchQueue(label: "dots.obstacle", qos: .userInitiated)
-    private let zeticClassifier = ZeticVisionClassifier()
     private var destinationWorldPoint: SIMD3<Float>?
+    private var activePathOrigin: SIMD3<Float>?
     @Published private(set) var remainingWaypoints: [SIMD3<Float>] = []
     @Published private(set) var renderedPath: [SIMD3<Float>] = []
     @Published private(set) var currentCameraTransform: simd_float4x4?
     private var lastTurnAnnouncementKey: String?
+    private var lastGuidanceSpeechDate = Date.distantPast
+    private var offPathBeganAt: Date?
+    private var lastObstacleSampleDate = Date.distantPast
+    private var lastObstacleLabel: String?
     private var lastObstacleAlertDate = Date.distantPast
     private var lastRecalculationDate = Date.distantPast
+    private var hasStartedSession = false
 
     init(envelope: RoomModelEnvelope, visualMeshURL: URL? = nil) {
         self.envelope = envelope
@@ -73,23 +77,40 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
         return lines.joined(separator: "\n")
     }
 
+    var roomContextJSON: String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(envelope),
+              let json = String(data: data, encoding: .utf8) else {
+            return ""
+        }
+        return json
+    }
+
     func attach(arView: ARView) {
         self.arView = arView
         arView.session.delegate = self
     }
 
     func startSession() {
-        guard let arView else { return }
+        guard !hasStartedSession, let arView else { return }
 
         let configuration = ARWorldTrackingConfiguration()
         configuration.worldAlignment = .gravityAndHeading // Enables compass heading
-        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {
-            configuration.sceneReconstruction = .meshWithClassification
-        }
-        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
-            configuration.frameSemantics.insert(.sceneDepth)
-        }
         arView.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
+        obstacleDetector.prepareModelIfNeeded()
+        hasStartedSession = true
+    }
+
+    func stopSession() {
+        speechEngine.stopSpeaking()
+        arView?.session.delegate = nil
+        arView?.session.pause()
+        arView?.scene.anchors.removeAll()
+        roomAnchor = nil
+        guideAnchor = nil
+        arView = nil
+        hasStartedSession = false
     }
 
     func alignUsingCurrentCameraPose() {
@@ -119,25 +140,26 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
         trackerProcessor.resetPositionTracking()
         distanceRemainingText = "--"
         obstacleMessage = nil
+        activePathOrigin = nil
+        offPathBeganAt = nil
+        lastObstacleSampleDate = .distantPast
+        lastObstacleLabel = nil
+        lastGuidanceSpeechDate = .distantPast
 
         destinationResolver = RoomDestinationResolver(envelope: envelope, roomWorldTransform: roomTransform)
         navigator = RoomNavigator(snapshot: envelope.capturedRoomSnapshot, roomWorldTransform: roomTransform)
-        obstacleDetector = DynamicObstacleDetector(envelope: envelope, roomWorldTransform: roomTransform)
         destinationNames = destinationResolver?.destinationNames ?? []
         facingSurfaceName = facingSurfaceName(for: frame.camera.transform, roomWorldTransform: roomTransform)
 
         renderRoom(at: roomTransform)
         stopNavigation(resetInstruction: false)
-
-        // Lazy-load ZETIC on-device vision model on first alignment
-        Task { await zeticClassifier.loadModel() }
     }
 
     @discardableResult
     func startNavigation(from sourceName: String? = nil, to destinationName: String) -> NavigationRequestResult {
         guard
             isReady,
-            let frame = arView?.session.currentFrame,
+            let camTransform = currentCameraTransform,
             let resolver = destinationResolver,
             let navigator
         else {
@@ -147,7 +169,9 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
             )
         }
 
-        let userPosition = RoomGeometry.translation(of: frame.camera.transform)
+        // Use the cached camera transform — never access session.currentFrame
+        // which retains an ARFrame and causes the "retaining 11 ARFrames" flood.
+        let userPosition = RoomGeometry.translation(of: camTransform)
         resolver.updateUserWorldPosition(userPosition)
 
         guard let candidate = resolver.resolveCandidate(destinationName) else {
@@ -158,7 +182,16 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
             )
         }
 
-        var response = "I'll guide you to \(candidate.name). Walk forward and I'll give you directions."
+        // Check if user is already at the destination
+        let distanceToDest = NavigationGuidanceMath.planarDistance(userPosition, candidate.worldPosition)
+        if distanceToDest < 0.8 {
+            currentInstruction = "You are already at \(candidate.name)."
+            return NavigationRequestResult(
+                didStart: false,
+                response: "You're already at \(candidate.name)! Is there somewhere else you'd like to go?"
+            )
+        }
+
         activeStartName = "Current Location"
 
         if let sourceName, !sourceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -182,7 +215,6 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
             }
 
             activeStartName = sourceCandidate.name
-            response = "I'll guide you from \(sourceCandidate.name) to \(candidate.name). Walk forward and I'll give you directions."
         }
 
         let path = navigator.findPath(from: userPosition, to: candidate.worldPosition)
@@ -196,33 +228,61 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
 
         activeDestinationName = candidate.name
         destinationWorldPoint = candidate.worldPosition
+        activePathOrigin = userPosition
         remainingWaypoints = path
         renderedPath = pathWithDestination(path, destination: candidate.worldPosition)
         isNavigationActive = true
         lastTurnAnnouncementKey = nil
         obstacleMessage = nil
+        offPathBeganAt = nil
+        lastObstacleSampleDate = .distantPast
+        lastObstacleLabel = nil
+        lastGuidanceSpeechDate = Date()
 
-        currentInstruction = "Starting navigation to \(candidate.name). Walk forward."
-        distanceRemainingText = formattedDistance(
-            NavigationGuidanceMath.distanceRemaining(
-                currentWorldPoint: userPosition,
-                remainingWaypoints: renderedPath
-            )
+        let remainingDistance = NavigationGuidanceMath.distanceRemaining(
+            currentWorldPoint: userPosition,
+            remainingWaypoints: renderedPath
+        )
+        let nextWaypoint = remainingWaypoints.first ?? candidate.worldPosition
+        let distanceToNext = NavigationGuidanceMath.planarDistance(userPosition, nextWaypoint)
+        let turnAngle = NavigationGuidanceMath.turnAngleDegrees(
+            currentHeadingTransform: camTransform,
+            targetWorldPoint: nextWaypoint,
+            currentWorldPoint: userPosition
+        )
+
+        currentInstruction = guidanceInstruction(
+            turnAngle: turnAngle,
+            distanceToNext: distanceToNext,
+            distanceRemaining: remainingDistance,
+            destinationName: candidate.name
+        )
+        distanceRemainingText = formattedDistance(remainingDistance)
+        lastTurnAnnouncementKey = guidanceAnnouncementKey(
+            turnAngle: turnAngle,
+            distanceRemaining: remainingDistance,
+            destinationName: candidate.name
         )
 
         renderPath()
-        return NavigationRequestResult(didStart: true, response: response)
+        return NavigationRequestResult(didStart: true, response: currentInstruction)
     }
 
     func stopNavigation(resetInstruction: Bool = true) {
+        speechEngine.stopSpeaking()
         isNavigationActive = false
         activeStartName = nil
         activeDestinationName = nil
         destinationWorldPoint = nil
+        activePathOrigin = nil
         remainingWaypoints = []
         renderedPath = []
         distanceRemainingText = "--"
         lastTurnAnnouncementKey = nil
+        lastGuidanceSpeechDate = .distantPast
+        offPathBeganAt = nil
+        lastObstacleSampleDate = .distantPast
+        lastObstacleLabel = nil
         obstacleMessage = nil
 
         if let guideAnchor, let arView {
@@ -240,27 +300,40 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
     // CRITICAL: Extract all needed values from ARFrame synchronously on
     // the ARKit callback thread. The ARFrame is released when this returns.
 
+    /// Lightweight value type — no ARFrame-retaining references.
     private struct FrameSnapshot {
         let cameraTransform: simd_float4x4
         let trackingState: ARCamera.TrackingState
         let eulerAnglesY: Float
-        let meshAnchors: [ARMeshAnchor]?
-        let pixelBuffer: CVPixelBuffer?
     }
 
-    func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        let needsObstacle = isNavigationActive
-            && obstacleDetector != nil
-            && Date().timeIntervalSince(lastObstacleAlertDate) > 2.0
 
+
+    func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        let shouldAnalyzeObstacle = isNavigationActive && Date().timeIntervalSince(lastObstacleSampleDate) >= 1.0
+        if shouldAnalyzeObstacle {
+            lastObstacleSampleDate = Date()
+            if let frameInput = obstacleDetector.makeFrameInput(from: frame.capturedImage) {
+                obstacleDetector.detectFrontObstacle(from: frameInput) { [weak self] warning in
+                    self?.applyFrontObstacleWarning(warning)
+                }
+            }
+        }
+
+        // Extract ONLY lightweight scalar values — NO ARMeshAnchor, NO CVPixelBuffer.
+        // This guarantees the ARFrame is released when this callback returns.
         let snapshot = FrameSnapshot(
             cameraTransform: frame.camera.transform,
             trackingState: frame.camera.trackingState,
-            eulerAnglesY: frame.camera.eulerAngles.y,
-            meshAnchors: needsObstacle ? frame.anchors.compactMap { $0 as? ARMeshAnchor } : nil,
-            pixelBuffer: needsObstacle ? frame.capturedImage : nil
+            eulerAnglesY: frame.camera.eulerAngles.y
         )
-        // ARFrame is released here — only lightweight snapshot crosses threads
+
+        // Run obstacle detection SYNCHRONOUSLY on this callback thread while the
+        // ARFrame is still on the stack. This way mesh anchors are never captured
+        // by a closure and never retain the ARFrame.
+
+        // ARFrame + meshAnchors + pixelBuffer are ALL released here.
+
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.trackerProcessor.processTransform(
@@ -325,6 +398,7 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
 
         while let first = remainingWaypoints.first,
               NavigationGuidanceMath.shouldAdvanceWaypoint(currentWorldPoint: currentPosition, waypoint: first) {
+            activePathOrigin = first
             remainingWaypoints.removeFirst()
         }
 
@@ -334,18 +408,30 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
             renderPath(clearOnly: true)
             isNavigationActive = false
             speechEngine.speak("You have arrived at \(activeDestinationName).")
+            lastGuidanceSpeechDate = Date()
             return
         }
 
-        let pathForChecks = pathWithDestination(remainingWaypoints, destination: destinationWorldPoint)
+        let pathForChecks = guidancePathForChecks(currentPosition: currentPosition, destination: destinationWorldPoint)
         if NavigationGuidanceMath.isOffPath(currentWorldPoint: currentPosition, waypoints: pathForChecks) {
-            if Date().timeIntervalSince(lastRecalculationDate) > 1.0 {
-                lastRecalculationDate = Date()
-                speechEngine.speak("Recalculating.")
-                currentInstruction = "Recalculating."
-                let updatedPath = navigator.findPath(from: currentPosition, to: destinationWorldPoint)
-                remainingWaypoints = updatedPath
+            if offPathBeganAt == nil {
+                offPathBeganAt = Date()
             }
+
+            let hasBeenOffPathLongEnough = Date().timeIntervalSince(offPathBeganAt ?? Date()) > 1.25
+            if hasBeenOffPathLongEnough, Date().timeIntervalSince(lastRecalculationDate) > 2.5 {
+                lastRecalculationDate = Date()
+                let updatedPath = navigator.findPath(from: currentPosition, to: destinationWorldPoint)
+                guard !updatedPath.isEmpty else { return }
+                speechEngine.speak("Recalculating.")
+                lastGuidanceSpeechDate = Date()
+                currentInstruction = "Recalculating."
+                activePathOrigin = currentPosition
+                remainingWaypoints = updatedPath
+                offPathBeganAt = nil
+            }
+        } else {
+            offPathBeganAt = nil
         }
 
         renderedPath = pathWithDestination(remainingWaypoints, destination: destinationWorldPoint)
@@ -362,68 +448,32 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
             targetWorldPoint: nextWaypoint,
             currentWorldPoint: currentPosition
         )
-
-        if let turn = NavigationGuidanceMath.turnInstruction(for: turnAngle) {
-            let direction = turn == .left ? "left" : "right"
-            currentInstruction = String(format: "In %.1f meters, turn %@.", distanceToNext, direction)
-            let roundedDistance = Int(distanceToNext * 10)
-            let announcementKey = "\(direction)-\(roundedDistance)-\(remainingWaypoints.count)"
-            if lastTurnAnnouncementKey != announcementKey {
-                speechEngine.speak(currentInstruction)
-                lastTurnAnnouncementKey = announcementKey
-            }
-        } else {
-            currentInstruction = "Walk forward."
-        }
-
-        distanceRemainingText = formattedDistance(
-            NavigationGuidanceMath.distanceRemaining(
-                currentWorldPoint: currentPosition,
-                remainingWaypoints: renderedPath
-            )
+        let remainingDistance = NavigationGuidanceMath.distanceRemaining(
+            currentWorldPoint: currentPosition,
+            remainingWaypoints: renderedPath
         )
 
-        // Obstacle detection — uses pre-extracted mesh anchors, never holds ARFrame
-        if let obstacleDetector,
-           let meshAnchors = snapshot.meshAnchors,
-           Date().timeIntervalSince(lastObstacleAlertDate) > 2.0 {
-            let camTransform = snapshot.cameraTransform
-            let pixelBuffer = snapshot.pixelBuffer
-            let classifierLoaded = zeticClassifier.isModelLoaded
-            obstacleQueue.async { [weak self] in
-                guard let self else { return }
-                guard let hit = obstacleDetector.detectObstacle(
-                    cameraTransform: camTransform,
-                    meshAnchors: meshAnchors
-                ) else { return }
+        currentInstruction = guidanceInstruction(
+            turnAngle: turnAngle,
+            distanceToNext: distanceToNext,
+            distanceRemaining: remainingDistance,
+            destinationName: activeDestinationName
+        )
+        let announcementKey = guidanceAnnouncementKey(
+            turnAngle: turnAngle,
+            distanceRemaining: remainingDistance,
+            destinationName: activeDestinationName
+        )
+        if lastTurnAnnouncementKey != announcementKey || now.timeIntervalSince(lastGuidanceSpeechDate) >= 4.0 {
+            speechEngine.speak(currentInstruction)
+            lastTurnAnnouncementKey = announcementKey
+            lastGuidanceSpeechDate = now
+        }
 
-                if classifierLoaded, let pixelBuffer {
-                    Task {
-                        let label = await self.zeticClassifier.classify(pixelBuffer: pixelBuffer)
-                        DispatchQueue.main.async {
-                            self.lastObstacleAlertDate = Date()
-                            if let label {
-                                self.obstacleMessage = String(format: "Caution: %@ ahead (%.1f m).", label.capitalized, hit.forwardDistance)
-                                self.speechEngine.speak("Caution: \(label) ahead.")
-                            } else {
-                                self.obstacleMessage = String(format: "Obstacle ahead (%.1f m).", hit.forwardDistance)
-                                self.speechEngine.speak("Obstacle ahead.")
-                            }
-                        }
-                    }
-                } else {
-                    DispatchQueue.main.async {
-                        self.lastObstacleAlertDate = Date()
-                        self.obstacleMessage = String(format: "Obstacle ahead (%.1f m).", hit.forwardDistance)
-                        self.speechEngine.speak("Obstacle ahead.")
-                    }
-                }
-            }
-        } else if let obstacleMessage, Date().timeIntervalSince(lastObstacleAlertDate) > 2.5 {
+        distanceRemainingText = formattedDistance(remainingDistance)
+        if obstacleMessage != nil, Date().timeIntervalSince(lastObstacleAlertDate) > 2.5 {
             self.obstacleMessage = nil
-            if obstacleMessage.contains("Obstacle ahead") || obstacleMessage.contains("Caution:") {
-                statusMessage = "Room aligned to the live camera feed."
-            }
+            statusMessage = "Room aligned to the live camera feed."
         }
     }
 
@@ -459,9 +509,8 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
         arView.scene.anchors.append(anchor)
         roomAnchor = anchor
 
-        if let visualMeshURL {
-            loadImportedVisualMesh(from: visualMeshURL, into: anchor)
-        }
+        // Imported USDZ meshes stay in the preview surface.
+        // Live navigation uses the lighter semantic room shell to keep AR stable.
     }
 
     private func loadImportedVisualMesh(from url: URL, into anchor: AnchorEntity) {
@@ -662,6 +711,45 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
         lhs.x * rhs.y - lhs.y * rhs.x
     }
 
+    private func guidanceInstruction(
+        turnAngle: Float,
+        distanceToNext: Float,
+        distanceRemaining: Float,
+        destinationName: String
+    ) -> String {
+        if let turn = NavigationGuidanceMath.turnInstruction(for: turnAngle) {
+            let direction = turn == .left ? "left" : "right"
+            if distanceToNext <= 0.8 {
+                return "Turn \(direction) now."
+            }
+            return String(format: "In %.1f meters, turn %@.", distanceToNext, direction)
+        }
+
+        if distanceRemaining <= 1.2 {
+            return String(format: "%@ is %.1f meters ahead. Keep going forward.", destinationName, max(distanceRemaining, 0))
+        }
+
+        return String(format: "Walk forward %.1f meters toward %@.", distanceRemaining, destinationName)
+    }
+
+    private func guidanceAnnouncementKey(
+        turnAngle: Float,
+        distanceRemaining: Float,
+        destinationName: String
+    ) -> String {
+        if let turn = NavigationGuidanceMath.turnInstruction(for: turnAngle) {
+            let direction = turn == .left ? "left" : "right"
+            return "turn-\(direction)-\(remainingWaypoints.count)"
+        }
+
+        if distanceRemaining <= 1.2 {
+            return "approach-\(destinationName)"
+        }
+
+        let bucket = max(0, Int(floor(distanceRemaining / 1.5)))
+        return "forward-\(destinationName)-\(bucket)"
+    }
+
     private func pathWithDestination(_ path: [SIMD3<Float>], destination: SIMD3<Float>) -> [SIMD3<Float>] {
         guard let last = path.last else { return [destination] }
         if NavigationGuidanceMath.planarDistance(last, destination) <= 0.25 {
@@ -670,8 +758,47 @@ final class RoomAnchoringController: NSObject, ObservableObject, ARSessionDelega
         return path + [destination]
     }
 
+    private func guidancePathForChecks(
+        currentPosition: SIMD3<Float>,
+        destination: SIMD3<Float>
+    ) -> [SIMD3<Float>] {
+        var points: [SIMD3<Float>] = []
+        points.append(activePathOrigin ?? currentPosition)
+        points.append(contentsOf: remainingWaypoints)
+        if NavigationGuidanceMath.planarDistance(points.last ?? destination, destination) > 0.25 {
+            points.append(destination)
+        }
+        return points
+    }
+
     private func formattedDistance(_ distance: Float) -> String {
         String(format: "%.1f m", max(0, distance))
+    }
+
+    private func applyFrontObstacleWarning(_ warning: FrontObstacleWarning?) {
+        guard isNavigationActive else {
+            obstacleMessage = nil
+            lastObstacleLabel = nil
+            return
+        }
+
+        guard let warning else {
+            if Date().timeIntervalSince(lastObstacleAlertDate) > 2.5 {
+                obstacleMessage = nil
+                lastObstacleLabel = nil
+            }
+            return
+        }
+
+        obstacleMessage = warning.message
+        statusMessage = warning.message
+
+        let shouldSpeak = lastObstacleLabel != warning.label || Date().timeIntervalSince(lastObstacleAlertDate) > 3.0
+        if shouldSpeak {
+            lastObstacleLabel = warning.label
+            lastObstacleAlertDate = Date()
+            speechEngine.speak(warning.message)
+        }
     }
 }
 
@@ -781,6 +908,7 @@ struct RoomAnchoringView: View {
                     messages: $controller.conversationMessages,
                     destinationNames: controller.destinationNames,
                     roomContext: controller.roomContextSummary,
+                    roomContextJSON: controller.roomContextJSON,
                     onNavigationRequested: { sourceName, destinationName in
                         controller.startNavigation(from: sourceName, to: destinationName)
                     },
@@ -864,8 +992,21 @@ struct RoomAnchoringView: View {
 struct RoomAnchoringARView: UIViewRepresentable {
     @ObservedObject var controller: RoomAnchoringController
 
+    final class Coordinator {
+        weak var controller: RoomAnchoringController?
+
+        init(controller: RoomAnchoringController) {
+            self.controller = controller
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(controller: controller)
+    }
+
     func makeUIView(context: Context) -> ARView {
         let arView = ARView(frame: .zero)
+        arView.automaticallyConfigureSession = false
         controller.attach(arView: arView)
         controller.startSession()
         return arView
@@ -873,7 +1014,8 @@ struct RoomAnchoringARView: UIViewRepresentable {
 
     func updateUIView(_ uiView: ARView, context: Context) {}
 
-    static func dismantleUIView(_ uiView: ARView, coordinator: ()) {
+    static func dismantleUIView(_ uiView: ARView, coordinator: Coordinator) {
+        coordinator.controller?.stopSession()
         uiView.session.pause()
     }
 }

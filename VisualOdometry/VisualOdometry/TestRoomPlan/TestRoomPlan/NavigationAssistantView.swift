@@ -1,4 +1,5 @@
 import AudioToolbox
+import Speech
 import SwiftUI
 
 // MARK: - Conversation Message
@@ -56,13 +57,11 @@ struct NavigationStatsHUD: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            // Instruction
             Text(instruction)
                 .font(.callout.weight(.semibold))
                 .foregroundStyle(.white)
                 .accessibilityLabel(instruction)
 
-            // Route label: Starting Point → Destination
             HStack(spacing: 6) {
                 Image(systemName: "circle.fill")
                     .font(.system(size: 6))
@@ -113,24 +112,23 @@ struct NavigationStatsHUD: View {
     }
 }
 
-// MARK: - Navigation Assistant View (Voice-First)
+// MARK: - Navigation Assistant View
 
-/// Voice-first navigation assistant. Listens for "Hey Dots" wake word,
-/// captures commands, and auto-submits after 2 seconds of silence.
-/// Keeps a visible transcript for sighted helpers and quick-tap destination chips.
+/// Live navigation assistant that uses push-to-talk speech capture.
 struct NavigationAssistantView: View {
     @Binding var messages: [ConversationMessage]
     let destinationNames: [String]
     let roomContext: String
+    let roomContextJSON: String
     let onNavigationRequested: (_ sourceName: String?, _ destinationName: String) -> NavigationRequestResult
     let onStopNavigation: () -> Void
     let isNavigationActive: Bool
 
     @StateObject private var wakeWordListener = WakeWordListener()
-    @StateObject private var intentRouter = ZeticIntentRouter()
+    private let intentRouter = ZeticIntentRouter()
     @State private var isProcessing = false
 
-    private let speechEngine = NavigationSpeechEngine()
+    private let speechEngine = NavigationSpeechEngine.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -158,8 +156,8 @@ struct NavigationAssistantView: View {
             }
 
             if !isNavigationActive {
-                // Voice status indicator
-                voiceStatusIndicator
+                // Voice status indicator + mic button
+                voiceStatusBar
 
                 // Quick destination chips (accessible via VoiceOver tap)
                 if !destinationNames.isEmpty {
@@ -204,36 +202,19 @@ struct NavigationAssistantView: View {
         )
         .onAppear {
             greetUser()
-            Task { await intentRouter.loadModel() }
-            setupWakeWord()
+            configureVoiceInput()
         }
         .onDisappear {
             wakeWordListener.stopEverything()
+            speechEngine.stopSpeaking()
         }
     }
 
-    // MARK: - Voice Status Indicator
+    // MARK: - Voice Status Bar (includes mic button)
 
-    private var voiceStatusIndicator: some View {
+    private var voiceStatusBar: some View {
         HStack(spacing: 12) {
-            // Animated mic indicator
-            ZStack {
-                Circle()
-                    .fill(micColor.opacity(0.15))
-                    .frame(width: 48, height: 48)
-
-                Circle()
-                    .fill(micColor.opacity(wakeWordListener.isCommandActive ? 0.3 : 0))
-                    .frame(width: 48, height: 48)
-                    .scaleEffect(wakeWordListener.isCommandActive ? 1.4 : 1.0)
-                    .animation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true), value: wakeWordListener.isCommandActive)
-
-                Image(systemName: micIconName)
-                    .font(.system(size: 20, weight: .semibold))
-                    .foregroundStyle(micColor)
-            }
-            .accessibilityLabel(micAccessibilityLabel)
-
+            // Status info
             VStack(alignment: .leading, spacing: 2) {
                 Text(statusText)
                     .font(.subheadline.weight(.medium))
@@ -248,74 +229,109 @@ struct NavigationAssistantView: View {
                     Text("Processing…")
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.5))
+                } else if let errorText = wakeWordListener.errorMessage {
+                    Text(errorText)
+                        .font(.caption)
+                        .foregroundStyle(.orange.opacity(0.9))
+                        .lineLimit(2)
                 } else {
-                    Text("Say \"Hey Dots\" to start")
+                    Text("Tap the mic to ask for a route or a room question")
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.5))
                 }
             }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(micAccessibilityLabel)
 
             Spacer()
+
+            // Manual mic button — always available as fallback
+            Button {
+                micButtonTapped()
+            } label: {
+                ZStack {
+                    Circle()
+                        .fill(micButtonColor.opacity(0.15))
+                        .frame(width: 52, height: 52)
+
+                    // Pulsing ring when actively recording
+                    if wakeWordListener.isCommandActive {
+                        Circle()
+                            .stroke(Color.green.opacity(0.5), lineWidth: 2)
+                            .frame(width: 52, height: 52)
+                            .scaleEffect(1.3)
+                            .opacity(0.6)
+                            .animation(
+                                .easeInOut(duration: 0.8).repeatForever(autoreverses: true),
+                                value: wakeWordListener.isCommandActive
+                            )
+                    }
+
+                    Image(systemName: micIconName)
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundStyle(micButtonColor)
+                }
+            }
+            .accessibilityLabel(wakeWordListener.isCommandActive ? "Stop recording" : "Start recording")
+            .accessibilityHint("Tap to speak a command")
         }
         .padding(.vertical, 4)
     }
 
-    private var micColor: Color {
+    // MARK: - Mic Button
+
+    private func micButtonTapped() {
+        if wakeWordListener.isCommandActive {
+            wakeWordListener.finishCommandCapture()
+            return
+        }
+
+        Task { @MainActor in
+            speechEngine.stopSpeaking()
+            let started = await wakeWordListener.activateManually()
+            if !started, let errorText = wakeWordListener.errorMessage {
+                messages.append(ConversationMessage(role: .assistant, text: errorText))
+            }
+        }
+    }
+
+    private var micButtonColor: Color {
         if wakeWordListener.isCommandActive { return .green }
-        if wakeWordListener.isPassiveListening { return .white }
-        return .gray
+        return .white
     }
 
     private var micIconName: String {
         if wakeWordListener.isCommandActive { return "waveform" }
-        if wakeWordListener.isPassiveListening { return "mic.fill" }
-        return "mic.slash"
+        return "mic.fill"
     }
 
     private var statusText: String {
         if isProcessing { return "Thinking…" }
         if wakeWordListener.isCommandActive { return "Listening…" }
-        if wakeWordListener.isPassiveListening { return "Ready" }
-        return "Starting…"
+        if wakeWordListener.errorMessage != nil { return "Microphone Needed" }
+        return "Tap To Talk"
     }
 
     private var micAccessibilityLabel: String {
         if wakeWordListener.isCommandActive { return "Recording your command" }
-        if wakeWordListener.isPassiveListening { return "Listening for Hey Dots" }
-        return "Microphone inactive"
+        return "Tap the microphone to ask for a route or room information"
     }
 
     // MARK: - Setup
 
     private func greetUser() {
-        let greeting = "How can I help you? Say Hey Dots, then tell me where you'd like to go."
+        let greeting = "How can I help you? Tap the mic to ask for directions or ask about this saved room."
         messages.append(ConversationMessage(role: .assistant, text: greeting))
         speechEngine.speak(greeting)
     }
 
-    private func setupWakeWord() {
-        wakeWordListener.onWakeWord = { [self] in
-            // Play a brief auditory cue that we're listening
+    private func configureVoiceInput() {
+        wakeWordListener.onWakeWord = {
             AudioServicesPlaySystemSound(1113) // Tink sound
         }
 
-        wakeWordListener.onCommandReady = { [self] command in
+        wakeWordListener.onCommandReady = { command in
             handleVoiceCommand(command)
-        }
-
-        // Start passive listening after greeting finishes
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            Task {
-                let authorized = await SpeechRecognitionManager().requestAuthorization()
-                if authorized {
-                    wakeWordListener.startPassiveListening()
-                } else {
-                    messages.append(ConversationMessage(
-                        role: .assistant,
-                        text: "I need microphone access to listen for your commands. Please enable it in Settings."
-                    ))
-                }
-            }
         }
     }
 
@@ -325,14 +341,18 @@ struct NavigationAssistantView: View {
         messages.append(ConversationMessage(role: .user, text: text))
         isProcessing = true
 
-        // Pause listening while we process
-        wakeWordListener.pauseListening()
+        if let route = parseRouteRequest(from: text) {
+            isProcessing = false
+            sendNavigationRequest(sourceName: route.sourceName, destinationName: route.destinationName)
+            return
+        }
 
         Task {
             let result = await intentRouter.resolveIntent(
                 userText: text,
                 destinations: destinationNames,
-                roomContext: roomContext
+                roomContext: roomContext,
+                roomContextJSON: roomContextJSON
             )
 
             await MainActor.run {
@@ -347,7 +367,7 @@ struct NavigationAssistantView: View {
                     speechEngine.speak(answerText)
 
                 case .unknown:
-                    // Try raw text as destination name
+                    // Try raw text as destination name directly
                     sendNavigationRequest(sourceName: nil, destinationName: text)
                 }
             }
@@ -355,8 +375,88 @@ struct NavigationAssistantView: View {
     }
 
     private func chooseDestination(_ name: String) {
+        wakeWordListener.stopEverything()
         messages.append(ConversationMessage(role: .user, text: "Take me to \(name)"))
         sendNavigationRequest(sourceName: nil, destinationName: name)
+    }
+
+    private func parseRouteRequest(from text: String) -> (sourceName: String, destinationName: String)? {
+        let lowered = text.lowercased()
+
+        if let route = parseRoutePattern(in: text, pattern: #"(?i)\bfrom\s+(.+?)\s+to\s+(.+)$"#) {
+            return route
+        }
+
+        if let route = parseRoutePattern(in: text, pattern: #"(?i)^(.+?)\s*->\s*(.+)$"#) {
+            return route
+        }
+
+        if lowered.contains(" to "), let route = parseLooseToRoute(in: text) {
+            return route
+        }
+
+        return nil
+    }
+
+    private func parseRoutePattern(in text: String, pattern: String) -> (sourceName: String, destinationName: String)? {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: range),
+              match.numberOfRanges == 3,
+              let sourceRange = Range(match.range(at: 1), in: text),
+              let destinationRange = Range(match.range(at: 2), in: text)
+        else {
+            return nil
+        }
+
+        let sourceFragment = String(text[sourceRange])
+        let destinationFragment = String(text[destinationRange])
+        guard
+            let sourceName = bestMatchingDestination(in: sourceFragment),
+            let destinationName = bestMatchingDestination(in: destinationFragment),
+            sourceName != destinationName
+        else {
+            return nil
+        }
+
+        return (sourceName, destinationName)
+    }
+
+    private func parseLooseToRoute(in text: String) -> (sourceName: String, destinationName: String)? {
+        guard let toRange = text.range(of: " to ", options: [.caseInsensitive]) else { return nil }
+
+        let sourceFragment = String(text[..<toRange.lowerBound])
+        let destinationFragment = String(text[toRange.upperBound...])
+
+        guard
+            let sourceName = bestMatchingDestination(in: sourceFragment),
+            let destinationName = bestMatchingDestination(in: destinationFragment),
+            sourceName != destinationName
+        else {
+            return nil
+        }
+
+        return (sourceName, destinationName)
+    }
+
+    private func bestMatchingDestination(in fragment: String) -> String? {
+        let lowered = fragment.lowercased()
+
+        if let exact = destinationNames.first(where: { lowered.contains($0.lowercased()) }) {
+            return exact
+        }
+
+        if lowered.contains("door") {
+            let digits = fragment.filter(\.isNumber)
+            if let doorNumber = Int(digits), doorNumber > 0 {
+                return destinationNames.first { candidate in
+                    candidate.lowercased().contains("door") &&
+                    candidate.contains("\(doorNumber)")
+                }
+            }
+        }
+
+        return nil
     }
 
     private func sendNavigationRequest(sourceName: String?, destinationName: String) {

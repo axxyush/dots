@@ -283,7 +283,7 @@ struct InteractiveRoomSceneView: UIViewRepresentable {
         }
 
         func flyToElement(_ element: TappableRoomElement) {
-            guard let scnView else { return }
+            guard scnView != nil else { return }
 
             let targetPosition = element.position
             let eyeHeight: Float = 1.55

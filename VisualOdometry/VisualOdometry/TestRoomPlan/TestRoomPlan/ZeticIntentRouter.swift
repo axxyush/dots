@@ -1,9 +1,5 @@
 import Foundation
 
-#if canImport(ZeticMLange)
-import ZeticMLange
-#endif
-
 /// Result from intent resolution — either a navigation destination or a Q&A answer.
 enum IntentResult {
     /// User wants to navigate somewhere.
@@ -14,59 +10,33 @@ enum IntentResult {
     case unknown
 }
 
-/// On-device LLM intent router via ZETIC Melange.
-/// Maps natural language like "I need to wash my hands" → "Bathroom",
-/// and answers contextual questions like "How many doors are there?" using room data.
-final class ZeticIntentRouter: ObservableObject, @unchecked Sendable {
-    @Published private(set) var isModelLoaded = false
-
-    #if canImport(ZeticMLange)
-    private var model: ZeticMLangeLLMModel?
-    #endif
-
-    /// Loads the Gemma-4 LLM from Melange. Call once on app/session start.
-    func loadModel() async {
-        guard !isModelLoaded else { return }
-
-        #if canImport(ZeticMLange)
-        do {
-            let loaded = try ZeticMLangeLLMModel(
-                personalKey: AppSecrets.zeticPersonalKey,
-                name: "changgeun/gemma-4-E2B-it",
-                version: 1,
-                modelMode: LLMModelMode.RUN_SPEED,
-                onDownload: { progress in
-                    print("[ZETIC LLM] Downloading model: \(Int(progress * 100))%")
-                }
-            )
-            self.model = loaded
-            self.isModelLoaded = true
-            print("[ZETIC LLM] Gemma model loaded successfully.")
-        } catch {
-            print("[ZETIC LLM] Failed to load model: \(error.localizedDescription)")
-        }
-        #else
-        print("[ZETIC LLM] ZeticMLange framework not available. Skipping model load.")
-        #endif
-    }
-
+/// Intent router for navigation requests and room-aware questions.
+/// It uses lightweight keyword routing for destinations and Gemini-backed
+/// Q&A when the user asks about the saved room model.
+struct ZeticIntentRouter: Sendable {
     // MARK: - Unified Intent Resolution
 
     /// Resolves user text into either a navigation command or a Q&A answer.
     func resolveIntent(
         userText: String,
         destinations: [String],
-        roomContext: String = ""
+        roomContext: String = "",
+        roomContextJSON: String = ""
     ) async -> IntentResult {
         // First check if it's a question about the room
         if isRoomQuestion(userText) {
-            if let answer = await answerRoomQuestion(userText: userText, roomContext: roomContext) {
+            if let answer = await answerRoomQuestion(
+                userText: userText,
+                roomContext: roomContext,
+                roomContextJSON: roomContextJSON
+            ) {
                 return .answer(text: answer)
             }
             // Fallback: try to answer from room context offline
             if let offlineAnswer = offlineRoomAnswer(userText: userText, roomContext: roomContext) {
                 return .answer(text: offlineAnswer)
             }
+            return .answer(text: "I couldn't find that in the saved room model yet.")
         }
 
         // Try LLM navigation intent
@@ -95,50 +65,22 @@ final class ZeticIntentRouter: ObservableObject, @unchecked Sendable {
         let lowered = text.lowercased()
         let questionKeywords = [
             "how many", "what", "which", "where", "is there", "are there",
-            "tell me about", "describe", "list", "count", "any", "do we have"
+            "tell me about", "describe", "list", "count", "any", "do we have",
+            "what's", "where's", "can you tell", "how far", "near"
         ]
-        return questionKeywords.contains { lowered.contains($0) }
+        return text.contains("?") || questionKeywords.contains { lowered.contains($0) }
     }
 
-    // MARK: - Room Q&A via LLM
+    // MARK: - Room Q&A
 
-    private func answerRoomQuestion(userText: String, roomContext: String) async -> String? {
-        guard !roomContext.isEmpty else { return nil }
-
-        #if canImport(ZeticMLange)
-        guard let model else { return nil }
-
-        let prompt = """
-        You are a helpful indoor navigation assistant for a visually impaired person.
-        Here is the room layout information:
-        \(roomContext)
-
-        The user asks: "\(userText)"
-
-        Give a brief, friendly answer in 1-2 sentences. Be specific with numbers and names.
-        """
-
-        do {
-            try model.run(prompt)
-            var buffer = ""
-            while true {
-                let waitResult = model.waitForNextToken()
-                if waitResult.generatedTokens == 0 { break }
-                buffer.append(waitResult.token)
-                if buffer.count > 200 { break }
-            }
-
-            let cleaned = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !cleaned.isEmpty else { return nil }
-            print("[ZETIC LLM] Q&A answer: \(cleaned)")
-            return cleaned
-        } catch {
-            print("[ZETIC LLM] Q&A error: \(error.localizedDescription)")
-            return nil
-        }
-        #else
-        return nil
-        #endif
+    private func answerRoomQuestion(userText: String, roomContext: String, roomContextJSON: String) async -> String? {
+        guard !roomContext.isEmpty || !roomContextJSON.isEmpty else { return nil }
+        let gemini = GeminiRoomAnswerService()
+        return await gemini.answer(
+            question: userText,
+            roomSummary: roomContext,
+            roomJSON: roomContextJSON
+        )
     }
 
     // MARK: - Offline Room Answers (No LLM fallback)
@@ -206,47 +148,8 @@ final class ZeticIntentRouter: ObservableObject, @unchecked Sendable {
     // MARK: - LLM Navigation Intent
 
     private func runLLMIntent(userText: String, destinations: [String]) async -> String? {
-        #if canImport(ZeticMLange)
-        guard let model else { return nil }
-
-        let destinationList = destinations.joined(separator: ", ")
-        let prompt = """
-        You are a navigation assistant. Given these room locations: [\(destinationList)], \
-        which one does the user want to go to? \
-        User said: "\(userText)". \
-        Reply with ONLY the exact location name from the list, nothing else.
-        """
-
-        do {
-            try model.run(prompt)
-
-            var buffer = ""
-            while true {
-                let waitResult = model.waitForNextToken()
-                let token = waitResult.token
-                let generatedTokens = waitResult.generatedTokens
-
-                if generatedTokens == 0 {
-                    break
-                }
-                buffer.append(token)
-
-                // Safety: stop after 100 tokens (we only need a short name)
-                if buffer.count > 100 { break }
-            }
-
-            let cleaned = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
-            print("[ZETIC LLM] Raw output: \(cleaned)")
-
-            // Find the best matching destination from the LLM output
-            return matchDestination(from: cleaned, candidates: destinations)
-        } catch {
-            print("[ZETIC LLM] Inference error: \(error.localizedDescription)")
-            return nil
-        }
-        #else
+        // LLM implementation removed.
         return nil
-        #endif
     }
 
     // MARK: - Keyword Fallback

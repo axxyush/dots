@@ -43,8 +43,18 @@ class ScanManager: NSObject, ObservableObject, ARSessionDelegate {
     // MARK: - ARSessionDelegate
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        // Extract lightweight scalar values synchronously to prevent retaining ARFrame
+        // in the async Task closure, which causes the "retaining 11 ARFrames" issue.
+        let transform = frame.camera.transform
+        let trackingState = frame.camera.trackingState
+        let eulerAnglesY = frame.camera.eulerAngles.y
+        
         Task { @MainActor in
-            self.trackerProcessor.processFrame(frame)
+            self.trackerProcessor.processTransform(
+                transform: transform,
+                trackingState: trackingState,
+                eulerAnglesY: eulerAnglesY
+            )
         }
     }
 }

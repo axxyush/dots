@@ -63,11 +63,10 @@ enum NavigationGuidanceMath {
     static func isOffPath(
         currentWorldPoint: SIMD3<Float>,
         waypoints: [SIMD3<Float>],
-        threshold: Float = 1.2
+        threshold: Float = 1.4
     ) -> Bool {
         guard !waypoints.isEmpty else { return false }
-        let nearest = waypoints.map { planarDistance(currentWorldPoint, $0) }.min() ?? 0
-        return nearest > threshold
+        return distanceToPath(currentWorldPoint: currentWorldPoint, waypoints: waypoints) > threshold
     }
 
     static func distanceRemaining(
@@ -111,6 +110,44 @@ enum NavigationGuidanceMath {
 
     static func planarDistance(_ lhs: SIMD3<Float>, _ rhs: SIMD3<Float>) -> Float {
         simd_distance(SIMD2<Float>(lhs.x, lhs.z), SIMD2<Float>(rhs.x, rhs.z))
+    }
+
+    static func distanceToPath(
+        currentWorldPoint: SIMD3<Float>,
+        waypoints: [SIMD3<Float>]
+    ) -> Float {
+        guard let first = waypoints.first else { return 0 }
+        if waypoints.count == 1 {
+            return planarDistance(currentWorldPoint, first)
+        }
+
+        let point = SIMD2<Float>(currentWorldPoint.x, currentWorldPoint.z)
+        var best = Float.greatestFiniteMagnitude
+
+        for (start3D, end3D) in zip(waypoints, waypoints.dropFirst()) {
+            let start = SIMD2<Float>(start3D.x, start3D.z)
+            let end = SIMD2<Float>(end3D.x, end3D.z)
+            best = min(best, distanceFromPoint(point, toSegmentFrom: start, to: end))
+        }
+
+        return best
+    }
+
+    private static func distanceFromPoint(
+        _ point: SIMD2<Float>,
+        toSegmentFrom start: SIMD2<Float>,
+        to end: SIMD2<Float>
+    ) -> Float {
+        let segment = end - start
+        let lengthSquared = simd_length_squared(segment)
+        guard lengthSquared > 0.0001 else {
+            return simd_distance(point, start)
+        }
+
+        let projected = simd_dot(point - start, segment) / lengthSquared
+        let t = max(0, min(1, projected))
+        let closest = start + segment * t
+        return simd_distance(point, closest)
     }
 
     /// Calculates the absolute compass bearing (0–360) from one world point to another.
