@@ -352,21 +352,10 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         _clear_session(ctx, sender)
         sess = {}
 
-    # No venue cached yet → expect a venue id.
-    if not sess.get("venue_loaded"):
-        match = VENUE_ID_REGEX.search(text)
-        if not match:
-            await ctx.send(
-                sender,
-                _reply_msg(
-                    "Welcome. Please say or send the venue ID posted at the entrance — "
-                    "it looks like venue dash followed by six characters."
-                ),
-            )
-            return
-
+    match = VENUE_ID_REGEX.search(text)
+    if match:
+        # User explicitly provided a venue ID. Look it up immediately.
         venue_id = match.group(0).lower()
-
         if not SENSEGRID_AGENT_ADDRESS:
             await ctx.send(
                 sender,
@@ -400,6 +389,17 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         await ctx.send(
             sender,
             _hold_msg(f"Looking up {venue_id}. One moment."),
+        )
+        return
+
+    # No venue cached yet and no venue ID in text → prompt the user.
+    if not sess.get("venue_loaded"):
+        await ctx.send(
+            sender,
+            _reply_msg(
+                "Welcome. Please say or send the venue ID posted at the entrance — "
+                "it looks like venue dash followed by six characters."
+            ),
         )
         return
 
