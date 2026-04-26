@@ -42,6 +42,16 @@ class AdaResponse(BaseModel):
     ada_findings_count: int = 0
 
 
+class FloorplanArtifactsResponse(BaseModel):
+    tactile_png_url: str
+    tactile_png_path: str
+    ada_pdf_url: str
+    ada_report_pdf_path: str
+    ada_summary: dict[str, int] = Field(default_factory=dict)
+    ada_report_text: str = ""
+    ada_findings_count: int = 0
+
+
 @app.get("/health")
 def health() -> dict:
     return {"ok": True}
@@ -84,15 +94,10 @@ def _generate_ada_response(image_path: Path | str) -> AdaResponse:
     )
 
 
-@app.post("/tactile/from-url", response_model=TactileResponse)
-def tactile_from_url(req: UrlRequest) -> TactileResponse:
-    dl = dispatch("download_image", {"url": req.image_url})
-    if "error" in dl:
-        raise HTTPException(status_code=400, detail=str(dl["error"]))
-
+def _generate_tactile_response(image_path: Path | str, model: str) -> TactileResponse:
     t = dispatch(
         "tactile_map_from_image_nanobanana",
-        {"image_path": dl["image_path"], "model": req.model},
+        {"image_path": str(image_path), "model": model},
     )
     if "error" in t:
         raise HTTPException(status_code=500, detail=str(t["error"]))
@@ -104,19 +109,37 @@ def tactile_from_url(req: UrlRequest) -> TactileResponse:
     return TactileResponse(tactile_png_url=up["url"], tactile_png_path=t["png_path"])
 
 
+def _generate_floorplan_artifacts_response(
+    image_path: Path | str, model: str
+) -> FloorplanArtifactsResponse:
+    tactile = _generate_tactile_response(image_path, model)
+    ada = _generate_ada_response(image_path)
+    return FloorplanArtifactsResponse(
+        tactile_png_url=tactile.tactile_png_url,
+        tactile_png_path=tactile.tactile_png_path,
+        ada_pdf_url=ada.ada_pdf_url,
+        ada_report_pdf_path=ada.ada_report_pdf_path,
+        ada_summary=ada.ada_summary,
+        ada_report_text=ada.ada_report_text,
+        ada_findings_count=ada.ada_findings_count,
+    )
+
+
+@app.post("/tactile/from-url", response_model=TactileResponse)
+def tactile_from_url(req: UrlRequest) -> TactileResponse:
+    dl = dispatch("download_image", {"url": req.image_url})
+    if "error" in dl:
+        raise HTTPException(status_code=400, detail=str(dl["error"]))
+    return _generate_tactile_response(dl["image_path"], req.model)
+
+
 @app.post("/tactile/from-upload", response_model=TactileResponse)
 def tactile_from_upload(
     file: UploadFile = File(...),
     model: str = "gemini-3-pro-image-preview",
 ) -> TactileResponse:
     p = _save_upload(file)
-    t = dispatch("tactile_map_from_image_nanobanana", {"image_path": str(p), "model": model})
-    if "error" in t:
-        raise HTTPException(status_code=500, detail=str(t["error"]))
-    up = dispatch("upload_artifact", {"file_path": t["png_path"]})
-    if "error" in up:
-        raise HTTPException(status_code=502, detail=str(up["error"]))
-    return TactileResponse(tactile_png_url=up["url"], tactile_png_path=t["png_path"])
+    return _generate_tactile_response(p, model)
 
 
 @app.post("/ada/from-url", response_model=AdaResponse)
@@ -131,3 +154,26 @@ def ada_from_url(req: UrlRequest) -> AdaResponse:
 def ada_from_upload(file: UploadFile = File(...)) -> AdaResponse:
     p = _save_upload(file)
     return _generate_ada_response(p)
+
+
+@app.post(
+    "/floorplan-artifacts/from-url",
+    response_model=FloorplanArtifactsResponse,
+)
+def floorplan_artifacts_from_url(req: UrlRequest) -> FloorplanArtifactsResponse:
+    dl = dispatch("download_image", {"url": req.image_url})
+    if "error" in dl:
+        raise HTTPException(status_code=400, detail=str(dl["error"]))
+    return _generate_floorplan_artifacts_response(dl["image_path"], req.model)
+
+
+@app.post(
+    "/floorplan-artifacts/from-upload",
+    response_model=FloorplanArtifactsResponse,
+)
+def floorplan_artifacts_from_upload(
+    file: UploadFile = File(...),
+    model: str = "gemini-3-pro-image-preview",
+) -> FloorplanArtifactsResponse:
+    p = _save_upload(file)
+    return _generate_floorplan_artifacts_response(p, model)
