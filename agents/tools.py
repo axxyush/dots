@@ -435,16 +435,17 @@ def tactile_map_from_image_nanobanana(image_path: str, model: str = "gemini-3-pr
 
 
 def tactile_map_from_images_nanobanana(
-    image_paths: list[str],
+    image_sources: list[str],
     model: str = "gemini-3-pro-image-preview",
 ) -> dict:
-    """Generate one tactile-map PNG from multiple room photos (all sent in a single Gemini call)."""
-    if not image_paths:
-        return {"error": "no image_paths provided"}
+    """Generate one tactile-map PNG from multiple room photos in a single Gemini call.
 
-    missing = [p for p in image_paths if not Path(p).exists()]
-    if missing:
-        return {"error": f"images not found: {missing}"}
+    image_sources may contain:
+      - https:// URLs  → passed directly to Gemini via Part.from_uri (no download)
+      - local file paths → read as bytes via Part.from_bytes
+    """
+    if not image_sources:
+        return {"error": "no image_sources provided"}
 
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -456,7 +457,7 @@ def tactile_map_from_images_nanobanana(
     except Exception as exc:
         return {"error": f"google-genai not available: {exc}"}
 
-    def _guess_mime(path: Path) -> str:
+    def _mime_from_path(path: Path) -> str:
         suf = path.suffix.lower()
         if suf in {".jpg", ".jpeg"}:
             return "image/jpeg"
@@ -466,13 +467,38 @@ def tactile_map_from_images_nanobanana(
             return "image/gif"
         return "image/png"
 
+    def _mime_from_url(url: str) -> str:
+        clean = url.split("?")[0].lower()
+        if clean.endswith(".jpg") or clean.endswith(".jpeg"):
+            return "image/jpeg"
+        if clean.endswith(".webp"):
+            return "image/webp"
+        if clean.endswith(".gif"):
+            return "image/gif"
+        return "image/jpeg"  # safe default for photos
+
     try:
         parts: list = [types.Part(text=_NANOBANANA_MULTIVIEW_PROMPT)]
-        for img_path in image_paths:
-            p = Path(img_path)
-            parts.append(
-                types.Part.from_bytes(data=p.read_bytes(), mime_type=_guess_mime(p))
-            )
+        for src in image_sources:
+            if src.startswith("http://") or src.startswith("https://"):
+                # Pass URL directly — Gemini fetches it, no local download needed.
+                parts.append(types.Part.from_uri(
+                    file_uri=src,
+                    mime_type=_mime_from_url(src),
+                ))
+            else:
+                # Local file path (e.g. decoded data: URI saved to temp).
+                p = Path(src)
+                if not p.exists():
+                    log.warning("skipping missing file: %s", src)
+                    continue
+                parts.append(types.Part.from_bytes(
+                    data=p.read_bytes(),
+                    mime_type=_mime_from_path(p),
+                ))
+
+        if len(parts) == 1:  # only the prompt, no images survived
+            return {"error": "no accessible images to send to Gemini"}
 
         client = genai.Client(api_key=api_key)
         cfg = types.GenerateContentConfig(
@@ -487,9 +513,7 @@ def tactile_map_from_images_nanobanana(
     except Exception as exc:
         return {"error": f"generation failed: {exc}"}
 
-    # Use the stem of the first image for the output filename.
-    stem = Path(image_paths[0]).stem
-    out_path = ARTIFACT_DIR / f"{stem}_tactile_multiview.png"
+    out_path = ARTIFACT_DIR / f"tactile_multiview_{uuid4().hex[:8]}.png"
 
     # Find first image part in response.
     resp_parts = getattr(resp, "parts", None) or []
@@ -498,7 +522,7 @@ def tactile_map_from_images_nanobanana(
             try:
                 img = part.as_image()
                 img.save(out_path)
-                return {"png_path": str(out_path), "model": model, "n_images": len(image_paths)}
+                return {"png_path": str(out_path), "model": model, "n_images": len(image_sources)}
             except Exception as exc:
                 return {"error": f"could not save output image: {exc}"}
 
@@ -511,15 +535,14 @@ def tactile_map_from_images_nanobanana(
                 try:
                     img = part.as_image()
                     img.save(out_path)
-                    return {"png_path": str(out_path), "model": model, "n_images": len(image_paths)}
+                    return {"png_path": str(out_path), "model": model, "n_images": len(image_sources)}
                 except Exception as exc:
                     return {"error": f"could not save output image: {exc}"}
 
-    text_out = ""
-    for part in resp_parts:
-        if getattr(part, "text", None):
-            text_out += part.text + "\n"
-    debug_path = ARTIFACT_DIR / f"{stem}_tactile_multiview_debug.txt"
+    text_out = "".join(
+        part.text + "\n" for part in resp_parts if getattr(part, "text", None)
+    )
+    debug_path = ARTIFACT_DIR / f"tactile_multiview_{uuid4().hex[:8]}_debug.txt"
     debug_path.write_text(text_out or "(no image returned)", encoding="utf-8")
     return {"error": f"model returned no image (see {debug_path})"}
 

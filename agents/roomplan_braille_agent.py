@@ -1,13 +1,13 @@
 """RoomPlanBraille — Fetch.ai chat agent: room photos → tactile map (Nano Banana Pro).
 
-Flow:
-  - Every message is checked for image attachments FIRST. Attachments are added
-    to a per-sender queue immediately, regardless of any text in the message.
-  - When the user says a trigger word ("generate", "done", "go", "make map", etc.)
-    ALL queued images are sent together in a single Gemini call so it can
-    synthesise a coherent top-down tactile map from every angle.
-  - "clear" / "reset" empties the queue without generating.
-  - "status" shows how many images are queued.
+Queue design:
+  - Every message is checked for images FIRST, before any intent is evaluated.
+  - Images are stored as references (https:// URLs or local paths for data: URIs).
+  - https:// URLs are queued as-is — Gemini fetches them directly at generation time,
+    so nothing is downloaded to disk during queuing.
+  - When the user says 'generate' / 'done' / 'go' etc., ALL queued image refs are
+    sent to Gemini in one call so it synthesises a single coherent tactile map.
+  - 'clear' empties the queue.  'status' shows how many refs are queued.
 
 Env:
   GEMINI_API_KEY               (required)
@@ -101,7 +101,7 @@ _HELP_TEXT = (
     "**How it works:**\n"
     "1. Attach photos (or paste http/https URLs) — each message adds to your queue.\n"
     "2. Say **'generate'** (or 'go', 'done', 'make map') when you've sent all your photos.\n"
-    "3. I send every queued photo to Gemini in one go so it can see the whole room.\n\n"
+    "3. All queued photos are sent to Gemini together so it can see the whole room.\n\n"
     "Other commands: **status** — see queue size · **clear** — empty the queue."
 )
 
@@ -126,7 +126,7 @@ def _extract_urls(text: str) -> list[str]:
 
 
 def _intent(text: str) -> str:
-    """Classify intent from normalised text. Images are handled separately before this."""
+    """Classify text intent. Images are always collected before this is called."""
     low = text.lower().strip().rstrip(".,!?")
     words = set(re.findall(r"[a-z]+", low))
     if not low:
@@ -135,7 +135,6 @@ def _intent(text: str) -> str:
         return "help"
     if low in _HI or words & _HI:
         return "hi"
-    # Exact-set match only for status — no substring check — to avoid false positives.
     if low in _STATUS or words & _STATUS:
         return "status"
     if low in _CLEAR or words & _CLEAR:
@@ -145,7 +144,7 @@ def _intent(text: str) -> str:
     return "other"
 
 
-# ── Session / queue helpers ───────────────────────────────────────────────────
+# ── Queue helpers ─────────────────────────────────────────────────────────────
 
 def _load_queue(ctx, sender: str) -> list[str]:
     raw = ctx.storage.get(f"{_QUEUE_KEY}:{sender}")
@@ -153,7 +152,7 @@ def _load_queue(ctx, sender: str) -> list[str]:
         return []
     try:
         q = json.loads(raw) if isinstance(raw, str) else raw
-        return [p for p in q if isinstance(p, str)]
+        return [r for r in q if isinstance(r, str)]
     except Exception:
         return []
 
@@ -166,9 +165,10 @@ def _clear_queue(ctx, sender: str) -> None:
     ctx.storage.set(f"{_QUEUE_KEY}:{sender}", json.dumps([]))
 
 
-# ── Image collection ──────────────────────────────────────────────────────────
+# ── Image ref collection ──────────────────────────────────────────────────────
 
 def _save_data_uri(uri: str, index: int) -> str | None:
+    """Decode a data: URI to a local temp file. Returns path or None."""
     try:
         header, encoded = uri.split(",", 1)
         mime = header.split(":")[1].split(";")[0] if ":" in header else "image/jpeg"
@@ -181,14 +181,17 @@ def _save_data_uri(uri: str, index: int) -> str | None:
         return None
 
 
-def _collect_new_images(msg: ChatMessage) -> tuple[list[str], list[str]]:
+def _collect_image_refs(msg: ChatMessage) -> tuple[list[str], list[str]]:
     """
-    Returns (saved_paths, errors) for images in this message only.
+    Returns (refs, errors).
 
-    Checks ResourceContent attachments first; falls back to http(s) URLs
-    found in TextContent only when no attachments are present.
+    refs is a list of image references to add to the queue:
+      - https:// URLs from ResourceContent or text  → stored as-is, Gemini fetches later
+      - data: URIs from ResourceContent             → decoded to a local temp file path
+
+    Nothing is downloaded during this step for https:// sources.
     """
-    paths: list[str] = []
+    refs: list[str] = []
     errors: list[str] = []
 
     for i, item in enumerate(msg.content):
@@ -197,65 +200,53 @@ def _collect_new_images(msg: ChatMessage) -> tuple[list[str], list[str]]:
         resources = item.resource if isinstance(item.resource, list) else [item.resource]
         for res in resources:
             uri = res.uri
-            if uri.startswith("data:"):
-                p = _save_data_uri(uri, i)
-                if p:
-                    paths.append(p)
-                    log.info("saved inline attachment #%d → %s", i, p)
+            if uri.startswith("https://") or uri.startswith("http://"):
+                # Queue the URL directly — no download needed.
+                refs.append(uri)
+                log.info("queued image URL from attachment #%d: %s…", i, uri[:60])
+            elif uri.startswith("data:"):
+                # Inline base64 image — decode to disk once, store path.
+                path = _save_data_uri(uri, i)
+                if path:
+                    refs.append(path)
+                    log.info("decoded inline attachment #%d → %s", i, path)
                 else:
                     errors.append(f"Could not decode attached image #{i + 1}.")
-            elif uri.startswith("http://") or uri.startswith("https://"):
-                dl = dispatch("download_image", {"url": uri})
-                if "error" not in dl:
-                    paths.append(dl["image_path"])
-                    log.info("downloaded attachment #%d → %s", i, dl["image_path"])
-                else:
-                    errors.append(f"Could not download image #{i + 1}: {dl['error']}")
             else:
                 log.warning("unknown URI scheme for attachment #%d: %s", i, uri[:40])
-                errors.append(f"Unsupported image URI for attachment #{i + 1}.")
+                errors.append(f"Unsupported image format for attachment #{i + 1}.")
 
     # Fall back to URLs in text only when no ResourceContent images were found.
-    if not paths:
+    if not refs:
         text = "".join(item.text for item in msg.content if isinstance(item, TextContent))
         for url in _extract_urls(text):
-            dl = dispatch("download_image", {"url": url})
-            if "error" not in dl:
-                paths.append(dl["image_path"])
-                log.info("downloaded text URL → %s", dl["image_path"])
-            else:
-                errors.append(f"Could not download {url}: {dl['error']}")
+            refs.append(url)
+            log.info("queued image URL from text: %s…", url[:60])
 
-    return paths, errors
+    return refs, errors
 
 
-# ── Generation helper ─────────────────────────────────────────────────────────
+# ── Generation ────────────────────────────────────────────────────────────────
 
 def _do_generate(
     ctx, sender: str, queue: list[str], extra_errors: list[str]
 ) -> tuple[str, list[AgentContent]]:
-    """Run Nano Banana Pro on the full queue, clear it, return reply + ResourceContent."""
+    """Send all queued image refs to Gemini, clear queue, return reply + ResourceContent."""
     no_extra: list[AgentContent] = []
 
-    live = [p for p in queue if Path(p).exists()]
-    dead = len(queue) - len(live)
-    if dead:
-        log.warning("%d queued image(s) expired from disk — skipping", dead)
-
-    if not live:
-        _clear_queue(ctx, sender)
+    if not queue:
         return (
-            "All queued images have been cleaned up from disk (temp files expire). "
-            "Please resend your photos.",
+            "Nothing in the queue yet. "
+            "Attach room photos first, then say 'generate'.",
             no_extra,
         )
 
-    n = len(live)
-    log.info("generating tactile map from %d image(s) for %s", n, sender[:16])
+    n = len(queue)
+    log.info("generating tactile map from %d image ref(s) for %s", n, sender[:16])
 
     t = dispatch(
         "tactile_map_from_images_nanobanana",
-        {"image_paths": live, "model": "gemini-3-pro-image-preview"},
+        {"image_sources": queue, "model": "gemini-3-pro-image-preview"},
     )
     if "error" in t:
         return f"Tactile map generation failed: {t['error']}", no_extra
@@ -291,17 +282,20 @@ def handle_chat(
     ctx, sender: str, msg: ChatMessage
 ) -> tuple[str, list[AgentContent]]:
     """
-    Images are ALWAYS collected and queued first, before any intent is evaluated.
-    This prevents intent mis-classification from swallowing image attachments.
+    Images are ALWAYS collected first, before any intent check, so attachments
+    are never lost to intent mis-classification.
     """
     no_extra: list[AgentContent] = []
 
-    # ── Step 1: collect images from this message and add to queue ─────────────
-    new_paths, collect_errors = _collect_new_images(msg)
-    if new_paths:
-        queue = _load_queue(ctx, sender) + new_paths
+    # ── Step 1: collect image refs from this message and add to queue ─────────
+    new_refs, collect_errors = _collect_image_refs(msg)
+    if new_refs:
+        queue = _load_queue(ctx, sender) + new_refs
         _save_queue(ctx, sender, queue)
-        log.info("queued %d new image(s) for %s — total %d", len(new_paths), sender[:16], len(queue))
+        log.info(
+            "queued %d new ref(s) for %s — total %d",
+            len(new_refs), sender[:16], len(queue),
+        )
     else:
         queue = _load_queue(ctx, sender)
 
@@ -311,28 +305,27 @@ def handle_chat(
     )
     intent = _intent(user_text)
 
-    # ── Step 3: if new images were added, acknowledge them first ─────────────
-    if new_paths:
-        n_new = len(new_paths)
+    # ── Step 3: if new images arrived, acknowledge them ───────────────────────
+    if new_refs:
+        n_new = len(new_refs)
         n_total = len(queue)
-        plural_new = "s" if n_new != 1 else ""
-        plural_total = "s" if n_total != 1 else ""
+        s_new = "s" if n_new != 1 else ""
+        s_total = "s" if n_total != 1 else ""
 
-        # If they also said "generate", do it immediately from the full queue.
+        # Generate immediately if they also typed the trigger word.
         if intent == "generate":
             return _do_generate(ctx, sender, queue, collect_errors)
 
         reply = (
-            f"Added {n_new} photo{plural_new}. "
-            f"Queue now has **{n_total} image{plural_total}**.\n\n"
+            f"Added {n_new} photo{s_new}. "
+            f"Queue now has **{n_total} image{s_total}**.\n\n"
             "Send more photos or say **'generate'** to create the tactile map."
         )
         if collect_errors:
             reply += "\n\nWarnings:\n" + "\n".join(f"- {e}" for e in collect_errors)
         return reply, no_extra
 
-    # ── Step 4: no new images — handle text-only intents ─────────────────────
-
+    # ── Step 4: no new images — handle text intent ────────────────────────────
     if intent == "help":
         return _HELP_TEXT, no_extra
 
@@ -346,10 +339,7 @@ def handle_chat(
     if intent == "status":
         n = len(queue)
         if n == 0:
-            return (
-                "Your queue is empty. Attach room photos to get started.",
-                no_extra,
-            )
+            return "Your queue is empty. Attach room photos to get started.", no_extra
         return (
             f"You have **{n}** image{'s' if n != 1 else ''} queued. "
             "Say **'generate'** when ready, or keep sending more photos.",
@@ -361,12 +351,6 @@ def handle_chat(
         return "Queue cleared. Send new room photos whenever you're ready.", no_extra
 
     if intent == "generate":
-        if not queue:
-            return (
-                "Nothing in the queue yet. "
-                "Attach room photos first, then say 'generate'.",
-                no_extra,
-            )
         return _do_generate(ctx, sender, queue, [])
 
     # ── Step 5: fallback ──────────────────────────────────────────────────────
