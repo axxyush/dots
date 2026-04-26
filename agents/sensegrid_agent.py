@@ -26,7 +26,9 @@ import json
 import logging
 import os
 import re
+import secrets
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,6 +59,8 @@ from uagents_core.contrib.protocols.chat import (
 )
 
 from agents.tools import dispatch
+from agents.wayfind_protocol import VenueLookup, VenueInfo
+from backend.map_store import MapStore
 from agents.payment import (
     GAS_BUFFER_ATESTFET,
     PAYMENT_TIMEOUT_S,
@@ -108,6 +112,22 @@ USER_PROXY_SEED = os.environ.get(
 )
 user_wallet = make_wallet_from_seed(USER_PROXY_SEED)
 
+# Persistent venue store, shared with backend/main.py so Wayfind can look up
+# scenes uploaded via either entry point.
+DEFAULT_DIMENSION_M = 15.0
+MAP_DB_PATH = Path(
+    os.environ.get(
+        "SENSEGRID_DB_PATH",
+        str(Path(tempfile.gettempdir()) / "dots_backend" / "maps.db"),
+    )
+)
+map_store = MapStore(MAP_DB_PATH)
+
+
+def _new_venue_id() -> str:
+    """Short, URL-safe id printable on a QR/NFC tag."""
+    return f"venue-{secrets.token_hex(3)}"
+
 # ── Two-step paywall state machine ───────────────────────────────────────────
 #
 # Payment is settled deterministically in Python. The LLM/ASI:One client is
@@ -119,6 +139,7 @@ user_wallet = make_wallet_from_seed(USER_PROXY_SEED)
 
 STATE_IDLE = "idle"
 STATE_QUOTED = "quoted"
+STATE_AWAITING_DIMENSION = "awaiting_dimension"
 STATE_PREVIEWED = "previewed"
 
 URL_REGEX = re.compile(r"https?://[^\s<>\"]+")
@@ -128,6 +149,8 @@ _TRAILING_PUNCT = ".,;:!?)\"']"
 _YES = {"yes", "y", "proceed", "ok", "okay", "go", "continue", "sure", "confirm", "yep", "yeah"}
 _NO = {"no", "n", "cancel", "stop", "nevermind", "abort", "nope"}
 _PAID = {"paid", "sent", "done"}
+_DIMENSION_SKIP = {"idk", "dunno", "skip", "default", "unknown"}
+_NUMBER_REGEX = re.compile(r"(\d+(?:\.\d+)?)")
 
 
 def _normalize(text: str) -> str:
@@ -195,10 +218,25 @@ def _clear_session(ctx, sender: str) -> None:
 def _process_plans(
     urls: list[str],
     logger: logging.Logger,
-) -> tuple[list[str], dict[str, int], list[dict], dict[str, int], str, list[str], str | None]:
+) -> tuple[
+    list[str],
+    dict[str, int],
+    list[dict],
+    dict[str, int],
+    str,
+    list[str],
+    dict | None,
+    dict | None,
+    str | None,
+]:
     """Download each URL and compute ADA compliance report inputs via CV parse.
 
-    Returns (image_paths, room_summary, ada_findings, ada_summary, ada_report_text, ada_pdf_urls, error_or_None).
+    Returns (image_paths, room_summary, ada_findings, ada_summary,
+    ada_report_text, ada_pdf_urls, first_floor_plan, first_dimensions_px,
+    error_or_None).
+
+    ``first_floor_plan`` is the structured scene from the first URL — used to
+    persist the venue for blind-user navigation.
     """
     image_paths: list[str] = []
     room_summary: dict[str, int] = {}
@@ -211,17 +249,31 @@ def _process_plans(
         "medium_severity": 0,
         "low_severity": 0,
     }
+    first_floor_plan: dict | None = None
+    first_dimensions_px: dict | None = None
 
     for url in urls:
         logger.info("processing %s", url)
         dl = dispatch("download_image", {"url": url})
         if "error" in dl:
-            return [], {}, [], {}, "", [], f"Couldn't download {url}: {dl['error']}"
+            return [], {}, [], {}, "", [], None, None, f"Couldn't download {url}: {dl['error']}"
         image_paths.append(dl["image_path"])
 
         parsed = dispatch("parse_floorplan", {"image_path": dl["image_path"]})
         if "error" in parsed:
-            return [], {}, [], {}, "", [], f"Couldn't compute ADA report for {url}: {parsed['error']}"
+            return [], {}, [], {}, "", [], None, None, f"Couldn't compute ADA report for {url}: {parsed['error']}"
+
+        if first_floor_plan is None:
+            first_dimensions_px = parsed.get("dimensions_px") or None
+            json_path = parsed.get("json_path")
+            if isinstance(json_path, str) and Path(json_path).exists():
+                try:
+                    blob = json.loads(Path(json_path).read_text(encoding="utf-8"))
+                    fp = blob.get("floor_plan") if isinstance(blob, dict) else None
+                    if isinstance(fp, dict):
+                        first_floor_plan = fp
+                except Exception as exc:
+                    logger.warning("could not load floor_plan from %s: %s", json_path, exc)
 
         for k, v in (parsed.get("rooms_by_type") or {}).items():
             room_summary[k] = room_summary.get(k, 0) + int(v)
@@ -252,7 +304,17 @@ def _process_plans(
         seen.add(key)
         uniq_findings.append(finding)
 
-    return image_paths, room_summary, uniq_findings, ada_summary, ada_report_text, ada_pdf_urls, None
+    return (
+        image_paths,
+        room_summary,
+        uniq_findings,
+        ada_summary,
+        ada_report_text,
+        ada_pdf_urls,
+        first_floor_plan,
+        first_dimensions_px,
+        None,
+    )
 
 
 def handle_chat(ctx, sender: str, user_text: str) -> str:
@@ -308,9 +370,17 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
                 f"{sess['quoted_fet_str']} test FET, or 'no' to cancel."
             )
 
-        image_paths, room_summary, ada_findings, ada_summary, ada_report_text, ada_pdf_urls, err = _process_plans(
-            sess["urls"], logger=logger
-        )
+        (
+            image_paths,
+            room_summary,
+            ada_findings,
+            ada_summary,
+            ada_report_text,
+            ada_pdf_urls,
+            first_floor_plan,
+            first_dimensions_px,
+            err,
+        ) = _process_plans(sess["urls"], logger=logger)
         if err:
             _clear_session(ctx, sender)
             return err
@@ -325,13 +395,15 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
 
         sess.update(
             {
-                "state": STATE_PREVIEWED,
+                "state": STATE_AWAITING_DIMENSION,
                 "image_paths": image_paths,
                 "room_summary": room_summary,
                 "ada_findings": ada_findings,
                 "ada_summary": ada_summary,
                 "ada_report_text": ada_report_text,
                 "ada_pdf_urls": ada_pdf_urls,
+                "floor_plan": first_floor_plan,
+                "dimensions_px": first_dimensions_px,
                 "start_balance_atestfet": start_balance,
                 "pay_address": pay_addr,
                 "expires_at": time.time() + PAYMENT_TIMEOUT_S,
@@ -339,6 +411,44 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
         )
         _save_session(ctx, sender, sess)
 
+        return (
+            "Parse complete. One quick question to make the navigation map "
+            "metric: **do you know the longest wall length in meters?** "
+            f"Reply with a number (e.g. `12`), or `no` / `skip` to use the "
+            f"default of {DEFAULT_DIMENSION_M:g} m."
+        )
+
+    if state == STATE_AWAITING_DIMENSION:
+        longest_wall_m: float | None = None
+        normalized = _normalize(user_text).lower()
+        words = set(re.findall(r"[a-z']+", normalized))
+
+        if intent == "no" or words & _DIMENSION_SKIP:
+            longest_wall_m = DEFAULT_DIMENSION_M
+        else:
+            m = _NUMBER_REGEX.search(normalized)
+            if m:
+                try:
+                    val = float(m.group(1))
+                    if 0.5 <= val <= 500.0:
+                        longest_wall_m = val
+                except ValueError:
+                    pass
+
+        if longest_wall_m is None:
+            return (
+                "I need a number in meters for the longest wall — e.g. `12` — "
+                f"or reply `skip` to use the default of {DEFAULT_DIMENSION_M:g} m."
+            )
+
+        sess["longest_wall_m"] = longest_wall_m
+        sess["state"] = STATE_PREVIEWED
+        sess["expires_at"] = time.time() + PAYMENT_TIMEOUT_S
+        _save_session(ctx, sender, sess)
+
+        room_summary = sess.get("room_summary") or {}
+        ada_findings = sess.get("ada_findings") or []
+        ada_summary = sess.get("ada_summary") or {}
         rooms_str = ", ".join(f"{k}: {v}" for k, v in sorted(room_summary.items()))
         pdfs = "\n".join(f"- {u}" for u in (sess.get("ada_pdf_urls") or []))
         pdf_block = f"**ADA report (PDF):**\n{pdfs}\n\n" if pdfs else ""
@@ -357,12 +467,13 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
         user_addr = str(user_wallet.address())
         return (
             f"Parsed {sum(room_summary.values())} rooms across {sess['n_plans']} plan{plural} "
-            f"({rooms_str}).\n\n"
+            f"({rooms_str}). Longest wall: **{longest_wall_m:g} m**.\n\n"
             f"{pdf_block}"
             f"{ada_block}"
             f"Reply **'yes'** to authorize payment of **{sess['quoted_fet_str']} test FET** "
-            f"— I'll execute the transfer on-chain (Dorado) automatically and deliver the "
-            f"tactile map. Reply 'no' to cancel.\n\n"
+            f"— I'll execute the transfer on-chain (Dorado) automatically, deliver the "
+            f"tactile map, and issue a navigation **venue ID** you can post at the "
+            f"entrance for blind visitors. Reply 'no' to cancel.\n\n"
             f"_Demo wallet: `{user_addr}` — top up at {FAUCET_URL}/{user_addr} if needed._"
         )
 
@@ -451,6 +562,30 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
                 continue
             tactile_png_urls.append(up_t["url"])
 
+        # Persist the venue so the Wayfind agent can answer questions about
+        # this floor plan for blind visitors.
+        venue_id: str | None = None
+        floor_plan = sess.get("floor_plan") if isinstance(sess.get("floor_plan"), dict) else None
+        if floor_plan:
+            venue_id = _new_venue_id()
+            try:
+                map_store.put_map(
+                    map_id=venue_id,
+                    layout_2d=floor_plan,
+                    metadata={
+                        "source": "sensegrid_agent",
+                        "longest_wall_m": float(sess.get("longest_wall_m") or DEFAULT_DIMENSION_M),
+                        "dimensions_px": sess.get("dimensions_px") or {},
+                        "rooms_by_type": sess.get("room_summary") or {},
+                        "owner": sender,
+                    },
+                    tactile_png_url=tactile_png_urls[0] if tactile_png_urls else None,
+                )
+                logger.info("persisted venue %s for sender %s", venue_id, sender[:12] + "…")
+            except Exception as exc:
+                logger.exception("failed to persist venue: %s", exc)
+                venue_id = None
+
         _clear_session(ctx, sender)
         tactile = "\n".join(f"- {u}" for u in tactile_png_urls) if tactile_png_urls else ""
         msg = (
@@ -462,6 +597,13 @@ def handle_chat(ctx, sender: str, user_text: str) -> str:
         if tactile_errors and not tactile_png_urls:
             # Surface failures so users don't think it's silently missing.
             msg += "\n\nTactile map generation failed:\n" + "\n".join(f"- {e}" for e in tactile_errors[:6])
+        if venue_id:
+            msg += (
+                f"\n\n**Navigation venue ID:** `{venue_id}`\n"
+                f"Print this on a QR code or NFC tag at the entrance. Blind "
+                f"visitors give this id to the Wayfind agent on ASI:One to ask "
+                f"voice questions about your space."
+            )
         msg += "\n\nThanks!"
         return msg
 
@@ -531,8 +673,59 @@ async def on_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
 agent.include(protocol, publish_manifest=True)
 
 
+# ── Wayfind venue lookup protocol (agent-to-agent) ──────────────────────────
+
+wayfind_protocol = Protocol(name="wayfind-venue", version="0.1.0")
+
+
+def _venue_info_for(venue_id: str) -> VenueInfo:
+    rec = map_store.get_map(venue_id)
+    if rec is None or not rec.layout_2d:
+        return VenueInfo(found=False, error="venue not found", venue_id=venue_id)
+
+    meta = rec.metadata or {}
+    longest_wall_m = float(meta.get("longest_wall_m") or DEFAULT_DIMENSION_M)
+    dims_px = meta.get("dimensions_px") or {}
+    width_px = float(dims_px.get("width") or 1.0)
+    height_px = float(dims_px.get("height") or 1.0)
+
+    # Map the longer pixel dimension to longest_wall_m, scale the shorter
+    # proportionally. Image y is flipped in the meter frame: (norm_x, norm_y)
+    # in 0–100 maps to (room_width_m * x/100, room_height_m * (1 - y/100)).
+    if width_px >= height_px:
+        room_width_m = longest_wall_m
+        room_height_m = longest_wall_m * (height_px / width_px)
+    else:
+        room_height_m = longest_wall_m
+        room_width_m = longest_wall_m * (width_px / height_px)
+
+    return VenueInfo(
+        found=True,
+        venue_id=venue_id,
+        venue_label=str(meta.get("label") or ""),
+        scene_json=json.dumps(rec.layout_2d, separators=(",", ":")),
+        room_width_m=room_width_m,
+        room_height_m=room_height_m,
+        # Bottom-center of the image = front of the room, on the meter floor.
+        entrance_x_m=room_width_m / 2.0,
+        entrance_y_m=0.0,
+        entrance_heading_deg=90.0,
+    )
+
+
+@wayfind_protocol.on_message(VenueLookup, replies={VenueInfo})
+async def on_venue_lookup(ctx: Context, sender: str, msg: VenueLookup):
+    ctx.logger.info("VenueLookup from %s for %s", sender[:12] + "…", msg.venue_id)
+    info = _venue_info_for(msg.venue_id.strip())
+    await ctx.send(sender, info)
+
+
+agent.include(wayfind_protocol, publish_manifest=True)
+
+
 if __name__ == "__main__":
     log.info("SenseGrid starting.")
+    log.info("Agent address (set as SENSEGRID_AGENT_ADDRESS for Wayfind): %s", agent.address)
     log.info("Service wallet (receives payments): %s", agent.wallet.address())
     log.info("Demo user-proxy wallet (auto-pays):  %s", user_wallet.address())
     log.info("Fund the user-proxy once at: %s/%s", FAUCET_URL, user_wallet.address())
